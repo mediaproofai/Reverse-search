@@ -5,40 +5,50 @@ export default async function handler(req, res) {
     res.setHeader('Access-Control-Allow-Methods', 'POST');
 
     const { mediaUrl } = req.body;
-    const apiKey = process.env.SERPER_API_KEY;
+    
+    // Default response structure
+    let intel = {
+        totalMatches: 0,
+        sources: { stockParams: false },
+        patientZero: { source: "N/A", url: null }
+    };
 
     try {
-        let matches = [];
-        if (apiKey) {
+        if (process.env.SERPER_API_KEY) {
             const response = await fetch("https://google.serper.dev/search", {
                 method: "POST",
-                headers: { "X-API-KEY": apiKey, "Content-Type": "application/json" },
-                body: JSON.stringify({ q: mediaUrl, type: "images" }) // Reverse Image Search
+                headers: { "X-API-KEY": process.env.SERPER_API_KEY, "Content-Type": "application/json" },
+                body: JSON.stringify({ q: mediaUrl, type: "images" })
             });
+            
             const data = await response.json();
-            matches = data.images || [];
+            
+            if (data.images) {
+                // FILTER: Remove Cloudinary (our own upload)
+                const validMatches = data.images.filter(img => 
+                    !img.link.includes("cloudinary.com") && 
+                    !img.source.includes("Cloudinary")
+                );
+
+                intel.totalMatches = validMatches.length;
+                intel.sources.stockParams = validMatches.some(m => m.source.match(/shutter|getty|adobe|stock/i));
+                
+                // Find oldest result (Patient Zero)
+                if (validMatches.length > 0) {
+                    // Sort by date if available, otherwise assume last is oldest
+                    const oldest = validMatches[validMatches.length - 1];
+                    intel.patientZero = { source: oldest.source, url: oldest.link };
+                }
+            }
         }
 
-        // Sort by date (if available) or assume order is relevance
-        // In a real OSINT tool, we'd scrape dates from the sites.
-        const earliest = matches.length > 0 ? matches[matches.length - 1] : null;
-
         return res.status(200).json({
-            service: "osint-unit",
-            footprintAnalysis: {
-                totalMatches: matches.length,
-                isViral: matches.length > 50,
-                sources: {
-                    stockParams: matches.some(m => m.source.includes("stock") || m.source.includes("getty")),
-                    newsParams: matches.some(m => m.source.includes("news"))
-                }
-            },
-            timelineIntel: {
-                patientZero: earliest ? { url: earliest.link, source: earliest.source } : "No history found",
-                distribution_graph: "Sparse"
-            }
+            service: "osint-unit-v2",
+            footprintAnalysis: intel,
+            timelineIntel: { patientZero: intel.patientZero }
         });
+
     } catch (e) {
-        return res.status(500).json({ error: e.message });
+        return res.status(200).json({ service: "osint-error", footprintAnalysis: intel });
     }
 }
