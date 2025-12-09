@@ -24,11 +24,12 @@ export default async function handler(req, res) {
             const data = await response.json();
             
             if (data.images) {
-                // FILTER: Remove Cloudinary (our own upload)
-                const validMatches = data.images.filter(img => 
-                    !img.link.includes("cloudinary.com") && 
-                    !img.source.includes("Cloudinary")
-                );
+               // FILTER: Remove Cloudinary, Verel, and Blob URLs
+const validMatches = data.images.filter(img => 
+    !img.link.includes("cloudinary.com") && 
+    !img.link.includes("vercel.app") &&
+    !img.source.includes("Cloudinary")
+);
 
                 intel.totalMatches = validMatches.length;
                 intel.sources.stockParams = validMatches.some(m => m.source.match(/shutter|getty|adobe|stock/i));
