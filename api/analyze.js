@@ -115,5 +115,5 @@ export default async function handler(req, res) {
             footprintAnalysis: intel, // Return empty intel
             error: e.message 
         });
-    }
+    
 
