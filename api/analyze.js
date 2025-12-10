@@ -12,7 +12,7 @@ const IGNORED_DOMAINS = [
 
 const STOCK_DOMAINS = ['shutter', 'getty', 'adobe', 'stock', 'freepik', 'unsplash', 'pexels', 'dreamstime', 'istock'];
 const NEWS_DOMAINS = ['cnn', 'bbc', 'nytimes', 'reuters', 'apnews', 'fox', 'guardian', 'forbes'];
-const SOCIAL_DOMAINS = ['twitter', 'x.com', 'reddit', 'facebook', 'instagram', 'linkedin', 'tiktok', 'pinterest'];
+const SOCIAL_DOMAINS = ['twitter', 'youtube', 'x.com', 'reddit', 'facebook', 'instagram', 'linkedin', 'tiktok', 'pinterest'];
 
 export default async function handler(req, res) {
     // 1. ENTERPRISE CORS
@@ -116,4 +116,4 @@ export default async function handler(req, res) {
             error: e.message 
         });
     }
-}
+
