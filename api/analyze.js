@@ -1,9 +1,9 @@
-import fetch from 'node-fetch'  //add a semicolon here to fix code
+import fetch from 'node-fetch';  
 
 // --- CONFIGURATION ---
 const IGNORED_DOMAINS = [
     'cloudinary.com',
-    'vercel.app',
+    'vercel.app' //add comma to fix code
     'blob:',
     'localhost',
     'file:',
