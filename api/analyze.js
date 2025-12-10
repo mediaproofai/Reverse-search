@@ -1,4 +1,4 @@
-import fetch from 'node-fetch';
+import fetch from 'node-fetch'  //add a semicolon here to fix code
 
 // --- CONFIGURATION ---
 const IGNORED_DOMAINS = [
@@ -115,5 +115,5 @@ export default async function handler(req, res) {
             footprintAnalysis: intel, // Return empty intel
             error: e.message 
         });
-    
-
+    }
+}
