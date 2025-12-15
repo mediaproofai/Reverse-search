@@ -1,16 +1,16 @@
 import fetch from 'node-fetch';
 
-// 1. TRUSTED AI HUBS (High Confidence Sources)
-const AI_DOMAINS = ['civitai.com', 'lexica.art', 'midjourney.com', 'discord.com', 'reddit.com', 'twitter.com', 'x.com', 'runwayml.com', 'pikalabs.org'];
+const IGNORED = ['cloudinary', 'vercel', 'blob:', 'discord', 'whatsapp', 'telegram'];
 
-// 2. GENERATOR FINGERPRINTS (Filename Regex)
-// Midjourney often looks like: 'grid_0_uuid' or 'user_prompt_uuid'
-// Stable Diffusion often looks like: 'date-time-seed'
-const FILENAME_PATTERNS = [
-    { name: 'Midjourney', regex: /[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}/i }, // UUID pattern
-    { name: 'Stable Diffusion', regex: /-\d{5,10}-/ }, // Seed numbers
-    { name: 'DALL-E', regex: /DALL·E/i },
-    { name: 'Runway', regex: /Runway/i }
+// 1. GENERATOR KEYWORDS (We scan for these, but we don't delete results if missing)
+const AI_LABS = [
+    { name: 'Midjourney', keys: ['midjourney', 'mj_'] },
+    { name: 'DALL-E', keys: ['dalle', 'dall-e'] },
+    { name: 'Stable Diffusion', keys: ['stable diffusion', 'sdxl', 'stablediffusion'] },
+    { name: 'Sora', keys: ['sora', 'openai'] },
+    { name: 'Runway', keys: ['runway'] },
+    { name: 'Pika', keys: ['pika'] },
+    { name: 'Flux', keys: ['flux'] }
 ];
 
 export default async function handler(req, res) {
@@ -22,94 +22,136 @@ export default async function handler(req, res) {
     const { mediaUrl } = req.body;
     const apiKey = process.env.SERPER_API_KEY;
 
+    // DEBUG LOG OBJECT
+    let debug = {
+        step: "init",
+        filename_detected: "none",
+        lens_attempt: "pending",
+        lens_raw_count: 0,
+        text_fallback: "pending",
+        final_verdict: "unknown"
+    };
+
     let intel = {
         totalMatches: 0,
         isViral: false,
         ai_generator_name: "Unknown",
-        matches: []
+        matches: [],
+        debug: debug // Send debug info to frontend
     };
 
     if (!mediaUrl) return res.status(400).json({ error: "No mediaUrl" });
 
     try {
-        const filename = mediaUrl.split('/').pop();
+        const filename = mediaUrl.split('/').pop().toLowerCase();
+        debug.filename_detected = filename;
 
-        // --- PHASE 1: FILENAME REGEX SCAN ---
-        // Check if the filename itself reveals the generator
-        for (const gen of FILENAME_PATTERNS) {
-            if (gen.regex.test(filename) || filename.toLowerCase().includes(gen.name.toLowerCase())) {
-                intel.ai_generator_name = `${gen.name} (Detected via Filename)`;
+        // --- PHASE 1: FILENAME SCAN ---
+        for (const gen of AI_LABS) {
+            if (gen.keys.some(k => filename.includes(k))) {
+                intel.ai_generator_name = `${gen.name} (Filename)`;
             }
         }
 
-        // --- PHASE 2: VISUAL SEARCH (Strict Mode) ---
         if (apiKey) {
-            const lensRes = await fetch("https://google.serper.dev/lens", {
-                method: "POST",
-                headers: { "X-API-KEY": apiKey, "Content-Type": "application/json" },
-                body: JSON.stringify({ url: mediaUrl, gl: "us", hl: "en" })
-            });
-            
-            const data = await lensRes.json();
-            const rawMatches = data.visualMatches || [];
+            let allMatches = [];
 
-            // *** THE FIX: RELEVANCE SCORING ***
-            const scoredMatches = rawMatches.map(m => {
-                let score = 0;
-                const text = (m.title + " " + m.source).toLowerCase();
-
-                // Point 1: Does it mention AI?
-                if (text.includes("ai ") || text.includes("generated") || text.includes("prompt") || text.includes("diffusion")) score += 2;
+            // --- PHASE 2: VISUAL SEARCH (LENS) ---
+            debug.step = "lens_request";
+            try {
+                const lensRes = await fetch("https://google.serper.dev/lens", {
+                    method: "POST",
+                    headers: { "X-API-KEY": apiKey, "Content-Type": "application/json" },
+                    body: JSON.stringify({ url: mediaUrl, gl: "us", hl: "en" })
+                });
                 
-                // Point 2: Is it from a known AI art site?
-                if (AI_DOMAINS.some(d => m.link.includes(d))) score += 3;
+                if (!lensRes.ok) debug.lens_attempt = `failed_${lensRes.status}`;
+                else {
+                    const lensData = await lensRes.json();
+                    const visual = lensData.visualMatches || [];
+                    debug.lens_attempt = "success";
+                    debug.lens_raw_count = visual.length;
+                    allMatches = visual;
+                }
+            } catch (e) { debug.lens_attempt = "error_" + e.message; }
 
-                // Point 3: Is it an EXACT visual match? (Serper sometimes flags this)
-                if (m.position && m.position === 1) score += 1;
+            // --- PHASE 3: FALLBACK TEXT SEARCH (If Lens failed or returned 0) ---
+            if (allMatches.length === 0) {
+                debug.step = "text_fallback";
+                // Clean filename: "my_image_123.jpg" -> "my image 123"
+                const query = filename.split('.')[0].replace(/[-_]/g, ' ');
+                
+                if (query.length > 3) {
+                    try {
+                        const textRes = await fetch("https://google.serper.dev/search", {
+                            method: "POST",
+                            headers: { "X-API-KEY": apiKey, "Content-Type": "application/json" },
+                            body: JSON.stringify({ q: query, gl: "us", hl: "en" })
+                        });
+                        const textData = await textRes.json();
+                        const organic = textData.organic || [];
+                        const images = textData.images || [];
+                        
+                        allMatches = [...organic, ...images];
+                        debug.text_fallback = `found_${allMatches.length}`;
+                    } catch (e) { debug.text_fallback = "error"; }
+                }
+            }
 
-                return { ...m, score };
-            });
-
-            // FILTER: Only keep matches with a score > 0 OR top 3 results if they look decent
-            // This removes random "visually similar" wallpapers that have no AI context.
-            const validMatches = scoredMatches
-                .filter(m => m.score > 0)
-                .sort((a, b) => b.score - a.score);
+            // --- PHASE 4: PROCESSING (NO DELETIONS) ---
+            // Filter out self-hosted links, but KEEP everything else
+            const validMatches = allMatches.filter(m => 
+                !IGNORED.some(d => (m.link || "").includes(d) || (m.source || "").includes(d))
+            );
 
             intel.totalMatches = validMatches.length;
-            intel.isViral = validMatches.length > 10;
+            intel.isViral = validMatches.length > 5;
 
-            intel.matches = validMatches.slice(0, 5).map(m => ({
-                source_name: m.source,
-                title: m.title,
-                url: m.link,
-                posted_time: "Found via Visual Match"
-            }));
-
-            // --- PHASE 3: CONTEXTUAL GENERATOR DETECTION ---
-            // If we found valid matches, scan them for generator names
-            if (intel.ai_generator_name.includes("Unknown") && validMatches.length > 0) {
-                const combinedText = validMatches.map(m => m.title).join(" ").toLowerCase();
+            // Map results (Top 10)
+            intel.matches = validMatches.slice(0, 10).map(m => {
+                const title = m.title || "Untitled Match";
+                const source = m.source || new URL(m.link).hostname;
+                const lowerText = (title + " " + source).toLowerCase();
                 
-                if (combinedText.includes("midjourney")) intel.ai_generator_name = "Midjourney";
-                else if (combinedText.includes("stable diffusion") || combinedText.includes("civitai")) intel.ai_generator_name = "Stable Diffusion";
-                else if (combinedText.includes("dall-e") || combinedText.includes("bing image")) intel.ai_generator_name = "DALL-E";
-                else if (combinedText.includes("sora")) intel.ai_generator_name = "Sora";
-                else if (combinedText.includes("pika")) intel.ai_generator_name = "Pika Labs";
-                else if (combinedText.includes("runway")) intel.ai_generator_name = "Runway Gen-2";
+                // Tag high-value matches
+                let tag = "Generic";
+                if (lowerText.includes("ai") || lowerText.includes("generated")) tag = "AI-Related";
+                
+                return {
+                    source_name: source,
+                    title: `[${tag}] ${title}`,
+                    url: m.link,
+                    posted_time: "Found Online"
+                };
+            });
+
+            // Try to find generator in the matches
+            if (intel.ai_generator_name === "Unknown") {
+                const combinedText = validMatches.map(m => (m.title + " " + m.snippet).toLowerCase()).join(" ");
+                for (const gen of AI_LABS) {
+                    if (gen.keys.some(k => combinedText.includes(k))) {
+                        intel.ai_generator_name = `${gen.name} (Context Match)`;
+                        break;
+                    }
+                }
             }
         }
 
+        // --- PHASE 5: RETURN ---
         return res.status(200).json({
-            service: "osint-strict-v4",
+            service: "osint-diagnostic-v5",
             footprintAnalysis: intel,
             timelineIntel: { 
-                first_seen: intel.matches.length > 0 ? "Publicly Indexed" : "Private / New Upload",
+                first_seen: intel.matches.length > 0 ? "Found Publicly" : "Unique/Private",
                 last_seen: "Just Now"
             }
         });
 
     } catch (e) {
-        return res.status(200).json({ service: "osint-fail", footprintAnalysis: intel, error: e.message });
+        return res.status(200).json({ 
+            service: "osint-crash", 
+            footprintAnalysis: intel, 
+            error: e.message 
+        });
     }
 }
