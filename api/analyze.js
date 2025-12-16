@@ -1,13 +1,12 @@
 import fetch from 'node-fetch';
 
-const IGNORED = ['cloudinary', 'vercel', 'blob:', 'discord', 'whatsapp', 'telegram'];
-
-// KNOWN AI GENERATORS
+// CONFIG
+const IGNORED = ['cloudinary', 'vercel', 'blob:', 'discord', 'whatsapp'];
 const AI_LABS = [
     { name: 'Midjourney', keys: ['midjourney', 'mj_'] },
     { name: 'DALL-E', keys: ['dalle', 'dall-e'] },
-    { name: 'Stable Diffusion', keys: ['stable diffusion', 'sdxl'] },
-    { name: 'Sora', keys: ['sora'] },
+    { name: 'Stable Diffusion', keys: ['stable diffusion', 'sdxl', 'stablediffusion'] },
+    { name: 'Sora', keys: ['sora', 'openai'] },
     { name: 'Runway', keys: ['runway'] },
     { name: 'Pika', keys: ['pika'] }
 ];
@@ -25,45 +24,61 @@ export default async function handler(req, res) {
         totalMatches: 0,
         ai_generator_name: "Unknown",
         matches: [],
-        debug: "Initialized"
+        method: "None",
+        version: "osint-omni-v6" // VERIFY THIS IN YOUR DEBUG LOGS
     };
 
     if (!mediaUrl) return res.status(400).json({ error: "No mediaUrl" });
 
     try {
-        if (!apiKey) {
-            intel.debug = "API Key Missing";
-            return res.status(200).json({ service: "osint-no-key", footprintAnalysis: intel });
-        }
+        if (apiKey) {
+            let rawMatches = [];
 
-        // --- VISUAL SEARCH (GOOGLE LENS) ---
-        const lensRes = await fetch("https://google.serper.dev/lens", {
-            method: "POST",
-            headers: { "X-API-KEY": apiKey, "Content-Type": "application/json" },
-            body: JSON.stringify({ url: mediaUrl, gl: "us", hl: "en" })
-        });
+            // --- STRATEGY 1: VISUAL SEARCH (LENS) ---
+            try {
+                const lensRes = await fetch("https://google.serper.dev/lens", {
+                    method: "POST",
+                    headers: { "X-API-KEY": apiKey, "Content-Type": "application/json" },
+                    body: JSON.stringify({ url: mediaUrl, gl: "us", hl: "en" })
+                });
+                const lensData = await lensRes.json();
+                
+                // Combine Visual Matches + Knowledge Graph
+                if (lensData.knowledgeGraph) rawMatches.push(lensData.knowledgeGraph);
+                if (lensData.visualMatches) rawMatches = rawMatches.concat(lensData.visualMatches);
+                
+                if (rawMatches.length > 0) intel.method = "Visual Fingerprint";
+            } catch (e) { console.log("Lens error", e); }
 
-        if (!lensRes.ok) {
-            intel.debug = `Lens Error: ${lensRes.status}`;
-        } else {
-            const data = await lensRes.json();
-            
-            // 1. COMBINE "KNOWLEDGE GRAPH" AND "VISUAL MATCHES"
-            // Knowledge Graph = "This is a cat" (Best Match)
-            // Visual Matches = "Here are similar images"
-            let allMatches = [];
-            if (data.knowledgeGraph) allMatches.push(data.knowledgeGraph);
-            if (data.visualMatches) allMatches = allMatches.concat(data.visualMatches);
+            // --- STRATEGY 2: TEXT FALLBACK (If Visual Failed) ---
+            if (rawMatches.length === 0) {
+                // "image_123.jpg" -> "image 123"
+                const filename = mediaUrl.split('/').pop().split('.')[0].replace(/[-_]/g, ' ');
+                
+                // Only search if filename has meaningful text (length > 3)
+                if (filename.length > 3 && !filename.startsWith("image")) {
+                    try {
+                        const textRes = await fetch("https://google.serper.dev/search", {
+                            method: "POST",
+                            headers: { "X-API-KEY": apiKey, "Content-Type": "application/json" },
+                            body: JSON.stringify({ q: filename, gl: "us", hl: "en" })
+                        });
+                        const textData = await textRes.json();
+                        if (textData.images) {
+                            rawMatches = textData.images;
+                            intel.method = "Filename Lookup";
+                        }
+                    } catch (e) { console.log("Text fallback error", e); }
+                }
+            }
 
-            // 2. FILTERING (Only remove CDN links, KEEP EVERYTHING ELSE)
-            const cleanMatches = allMatches.filter(m => 
+            // --- PROCESSING ---
+            const cleanMatches = rawMatches.filter(m => 
                 !IGNORED.some(d => (m.link || "").includes(d))
             );
 
             intel.totalMatches = cleanMatches.length;
-            intel.debug = `Found ${cleanMatches.length} raw matches`;
-
-            // 3. MAP RESULTS
+            
             intel.matches = cleanMatches.slice(0, 8).map(m => ({
                 source_name: m.source || m.title || "Web Result",
                 title: m.title || "Visual Match",
@@ -71,10 +86,8 @@ export default async function handler(req, res) {
                 posted_time: "Found Online"
             }));
 
-            // 4. DETECT GENERATOR FROM SEARCH CONTEXT
-            // Scan the titles of the matches for AI keywords
+            // DETECT GENERATOR
             const combinedText = cleanMatches.map(m => (m.title + " " + m.source).toLowerCase()).join(" ");
-            
             for (const gen of AI_LABS) {
                 if (gen.keys.some(k => combinedText.includes(k))) {
                     intel.ai_generator_name = gen.name;
@@ -84,15 +97,15 @@ export default async function handler(req, res) {
         }
 
         return res.status(200).json({
-            service: "osint-unfiltered-v1",
+            service: "osint-omni-v6",
             footprintAnalysis: intel,
             timelineIntel: { 
-                first_seen: intel.matches.length > 0 ? "Publicly Indexed" : "Unique",
+                first_seen: intel.matches.length > 0 ? "Publicly Indexed" : "Private",
                 last_seen: "Just Now"
             }
         });
 
     } catch (e) {
-        return res.status(200).json({ error: e.message, service: "osint-crash" });
+        return res.status(200).json({ service: "osint-crash", error: e.message });
     }
 }
