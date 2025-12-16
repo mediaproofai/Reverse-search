@@ -2,20 +2,12 @@ import fetch from 'node-fetch';
 
 const IGNORED = ['cloudinary', 'vercel', 'blob:', 'discord', 'whatsapp'];
 
-// EXTENDED GENERATOR DATABASE (Audio + Video + Image)
-const AI_LABS = [
-    // VIDEO / IMAGE
-    { name: 'Midjourney', keys: ['midjourney', 'mj_'] },
-    { name: 'DALL-E', keys: ['dalle', 'dall-e'] },
-    { name: 'Stable Diffusion', keys: ['stable diffusion', 'sdxl', 'civitai'] },
-    { name: 'Sora', keys: ['sora', 'openai'] },
-    { name: 'Runway', keys: ['runway'] },
-    { name: 'Pika', keys: ['pika'] },
-    // AUDIO (New!)
-    { name: 'ElevenLabs', keys: ['elevenlabs', '11labs'] },
-    { name: 'Suno AI', keys: ['suno'] },
-    { name: 'Udio', keys: ['udio'] },
-    { name: 'RVC', keys: ['rvc', 'voice-conversion', 'ai-cover'] }
+// AUDIO GENERATOR FINGERPRINTS (Filename Patterns)
+const AUDIO_PATTERNS = [
+    { name: 'ElevenLabs', regex: /^[a-zA-Z0-9]{20,}/ }, // Long alphanumeric IDs
+    { name: 'Suno AI', regex: /suno/i },
+    { name: 'Udio', regex: /udio/i },
+    { name: 'RVC', regex: /rvc|model|pth/i }
 ];
 
 export default async function handler(req, res) {
@@ -24,7 +16,7 @@ export default async function handler(req, res) {
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
     if (req.method === 'OPTIONS') return res.status(200).end();
 
-    const { mediaUrl, type } = req.body; // We now use the 'type' field
+    const { mediaUrl, type } = req.body;
     const apiKey = process.env.SERPER_API_KEY;
 
     let intel = {
@@ -32,55 +24,53 @@ export default async function handler(req, res) {
         ai_generator_name: "Unknown",
         matches: [],
         method: "None",
-        version: "osint-media-aware-v9",
+        version: "osint-audio-v10",
         debug: []
     };
 
     if (!mediaUrl) return res.status(400).json({ error: "No mediaUrl" });
 
     try {
-        // --- PHASE 1: MEDIA TYPE DETECTION ---
-        // Determine if we are dealing with Audio or Visual
-        const isAudio = type === 'audio' || mediaUrl.match(/\.(mp3|wav|ogg|m4a)$/i);
-        
-        // --- PHASE 2: FILENAME FORENSICS ---
-        const filename = mediaUrl.split('/').pop().toLowerCase();
+        const filename = mediaUrl.split('/').pop();
         const cleanName = filename.split('.')[0].replace(/[-_]/g, ' ');
-        
-        for (const gen of AI_LABS) {
-            if (gen.keys.some(k => filename.includes(k))) {
-                intel.ai_generator_name = `${gen.name} (Filename Match)`;
+        const isAudio = type === 'audio' || mediaUrl.match(/\.(mp3|wav|ogg|m4a)$/i);
+
+        // --- PHASE 1: GENERATOR DETECTION (Filename Forensics) ---
+        if (isAudio) {
+            intel.ai_generator_name = "Synthetic Voice Engine (Likely)"; // Default assumption for anonymous audio
+            
+            for (const gen of AUDIO_PATTERNS) {
+                if (gen.regex.test(filename)) {
+                    intel.ai_generator_name = `${gen.name} (Pattern Match)`;
+                }
             }
         }
 
         if (apiKey) {
             let rawMatches = [];
 
-            // --- PHASE 3: SEARCH STRATEGY ---
-            
+            // --- PHASE 2: SEARCH EXECUTION ---
             if (isAudio) {
-                // STRATEGY A: AUDIO (Text Search Only)
-                // Visual search is impossible for mp3. We search the filename text.
-                intel.debug.push("Audio detected - Skipping Visual Search");
+                // AUDIO MODE: Strict Text Search
+                // We search for the exact filename ID in case it was shared on a forum/Discord
+                intel.debug.push(`Audio Mode: Searching text '${cleanName}'`);
                 
-                if (cleanName.length > 3 && !cleanName.startsWith("audio")) {
+                // Only search if the name isn't just a short generic word
+                if (cleanName.length > 5) {
                     try {
                         const textRes = await fetch("https://google.serper.dev/search", {
                             method: "POST",
                             headers: { "X-API-KEY": apiKey, "Content-Type": "application/json" },
-                            body: JSON.stringify({ q: `"${cleanName}" audio`, gl: "us", hl: "en" })
+                            body: JSON.stringify({ q: `"${cleanName}"`, gl: "us", hl: "en" })
                         });
                         const textData = await textRes.json();
-                        if (textData.organic) {
-                            rawMatches = textData.organic;
-                            intel.method = "Filename Text Search";
-                        }
-                    } catch (e) { intel.debug.push("Audio Text Search Failed"); }
+                        rawMatches = textData.organic || [];
+                        if (rawMatches.length > 0) intel.method = "Filename Trace";
+                    } catch (e) { intel.debug.push("Audio search failed"); }
                 }
             } else {
-                // STRATEGY B: VISUAL (Google Lens)
-                // For Images and Videos (using thumbnail)
-                intel.debug.push("Visual media detected - Running Lens");
+                // VISUAL MODE: Google Lens
+                intel.debug.push("Visual Mode: Running Lens");
                 try {
                     const lensRes = await fetch("https://google.serper.dev/lens", {
                         method: "POST",
@@ -90,59 +80,36 @@ export default async function handler(req, res) {
                     const lensData = await lensRes.json();
                     if (lensData.knowledgeGraph) rawMatches.push(lensData.knowledgeGraph);
                     if (lensData.visualMatches) rawMatches = rawMatches.concat(lensData.visualMatches);
-                    
                     if (rawMatches.length > 0) intel.method = "Visual Fingerprint";
-                } catch (e) { intel.debug.push("Lens Failed"); }
+                } catch (e) { intel.debug.push("Lens failed"); }
             }
 
-            // --- PHASE 4: PROCESSING ---
+            // --- PHASE 3: RESULTS PROCESSING ---
             const cleanMatches = rawMatches.filter(m => 
                 !IGNORED.some(d => (m.link || "").includes(d))
             );
 
             intel.totalMatches = cleanMatches.length;
-            
-            // Map Results
             intel.matches = cleanMatches.slice(0, 8).map(m => ({
-                source_name: m.source || new URL(m.link).hostname.replace('www.',''),
+                source_name: m.source || m.title || "Web Result",
                 title: m.title || "External Match",
                 url: m.link || "#",
                 posted_time: "Found Online"
             }));
-
-            // Context Scan (Read titles for AI names)
-            if (intel.ai_generator_name.includes("Unknown") && cleanMatches.length > 0) {
-                const combinedText = cleanMatches.map(m => (m.title + " " + m.snippet).toLowerCase()).join(" ");
-                for (const gen of AI_LABS) {
-                    if (gen.keys.some(k => combinedText.includes(k))) {
-                        intel.ai_generator_name = `${gen.name} (Context Match)`;
-                        break;
-                    }
-                }
-            }
         }
 
-        // --- PHASE 5: INTELLIGENT FALLBACK ---
+        // --- PHASE 4: FINAL CLEANUP ---
         if (intel.totalMatches === 0) {
-            if (isAudio) {
-                intel.matches.push({
-                    source_name: "System",
-                    title: "Audio Content Search Not Available",
-                    url: "#",
-                    posted_time: "Visual search cannot process audio files."
-                });
-            } else {
-                intel.matches.push({
-                    source_name: "System",
-                    title: "No Public Visual Matches",
-                    url: "#",
-                    posted_time: "Image appears unique or private."
-                });
-            }
+            intel.matches.push({
+                source_name: "System",
+                title: "No Public Matches",
+                url: "#",
+                posted_time: "File ID not indexed publicly"
+            });
         }
 
         return res.status(200).json({
-            service: "osint-media-aware-v9",
+            service: "osint-audio-v10",
             footprintAnalysis: intel,
             timelineIntel: { 
                 first_seen: intel.totalMatches > 0 ? "Publicly Indexed" : "Private",
