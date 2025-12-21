@@ -43,6 +43,14 @@ function identifyGeneratorByRes(w, h) {
     return "Unknown";
 }
 
+// --- GARBAGE TEXT DETECTOR ---
+// Returns true if string looks like random ID (e.g., "dbxbsprqw7v")
+function isGarbage(text) {
+    if (text.length > 15 && !text.includes(' ')) return true; // Long single word
+    if (text.match(/[0-9]{4,}/) && text.match(/[a-z]{4,}/)) return true; // Mixed letters numbers
+    return false;
+}
+
 export default async function handler(req, res) {
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'POST');
@@ -57,7 +65,7 @@ export default async function handler(req, res) {
         ai_generator_name: "Unknown",
         matches: [],
         method: "None",
-        version: "osint-debug-pro-v14",
+        version: "osint-final-v15",
         debug: []
     };
 
@@ -67,7 +75,19 @@ export default async function handler(req, res) {
         const isAudio = type === 'audio' || mediaUrl.match(/\.(mp3|wav|ogg)$/i);
         const filename = mediaUrl.split('/').pop().toLowerCase();
         
-        // PHASE 1: DIMS
+        // --- STEP 1: URL HEALTH CHECK ---
+        // Ensure Google can actually reach this image
+        try {
+            const ping = await fetch(mediaUrl, { method: 'HEAD' });
+            if (!ping.ok) {
+                intel.debug.push(`URL Unreachable: ${ping.status}`);
+                // Proceed anyway, but note it
+            } else {
+                intel.debug.push(`URL Public: OK`);
+            }
+        } catch (e) { intel.debug.push("URL Check Error"); }
+
+        // --- STEP 2: DIMS & GEN ID ---
         if (!isAudio) {
             try {
                 const imgRes = await fetch(mediaUrl); 
@@ -81,11 +101,11 @@ export default async function handler(req, res) {
             } catch (e) { intel.debug.push("Dim Check Failed"); }
         }
 
-        // PHASE 2: API SEARCH
+        // --- STEP 3: API SEARCH ---
         if (apiKey) {
             let rawMatches = [];
             
-            // --- TRY LENS ---
+            // A. LENS (Visual)
             if (!isAudio) {
                 try {
                     const lRes = await fetch("https://google.serper.dev/lens", {
@@ -95,31 +115,25 @@ export default async function handler(req, res) {
                     });
                     
                     if (!lRes.ok) {
-                        // CRITICAL: Capture the exact API error (e.g., 403 Forbidden)
-                        const errText = await lRes.text();
-                        intel.debug.push(`LENS API FAIL: ${lRes.status} - ${errText}`);
-                        intel.matches.push({
-                            source_name: "API ERROR",
-                            title: `Google Refused Connection: ${lRes.status}`,
-                            url: "#",
-                            posted_time: "Check API Key Credits"
-                        });
+                        intel.debug.push(`Lens API HTTP ${lRes.status}`);
                     } else {
                         const lData = await lRes.json();
                         if (lData.knowledgeGraph) rawMatches.push(lData.knowledgeGraph);
                         if (lData.visualMatches) rawMatches = rawMatches.concat(lData.visualMatches);
+                        
+                        intel.debug.push(`Lens Results: ${rawMatches.length}`);
                         if (rawMatches.length > 0) intel.method = "Visual Fingerprint";
                     }
                 } catch (e) { intel.debug.push("Lens Network Error"); }
             }
 
-            // --- TRY TEXT FALLBACK ---
-            // If Lens failed (or is audio), try text
+            // B. TEXT (Fallback)
             if (rawMatches.length === 0) {
                 const cleanName = filename.split('.')[0].replace(/[-_]/g, ' ');
-                // Only search if it looks like a real name (not just 'image')
-                if (cleanName.length > 4 && !cleanName.startsWith("image")) {
-                    intel.debug.push(`Trying Text: ${cleanName}`);
+                
+                // Only search if name is meaningful and NOT garbage
+                if (cleanName.length > 3 && !cleanName.startsWith("image") && !isGarbage(cleanName)) {
+                    intel.debug.push(`Text Search: "${cleanName}"`);
                     try {
                         const sRes = await fetch("https://google.serper.dev/search", {
                             method: "POST",
@@ -127,35 +141,31 @@ export default async function handler(req, res) {
                             body: JSON.stringify({ q: cleanName, gl: "us", hl: "en" })
                         });
                         const sData = await sRes.json();
-                        // Capture API error here too
-                        if (sData.error) intel.debug.push(`TEXT API FAIL: ${JSON.stringify(sData.error)}`);
-                        
                         const organic = sData.organic || [];
                         const images = sData.images || [];
                         rawMatches = [...organic, ...images];
                         if (rawMatches.length > 0) intel.method = "Filename Trace";
                     } catch (e) { intel.debug.push("Text Search Error"); }
+                } else {
+                    intel.debug.push("Skipped Text Search (Name is garbage/generic)");
                 }
             }
 
-            // PROCESSING
+            // C. MAPPING
             const cleanMatches = rawMatches.filter(m => 
                 !IGNORED.some(d => (m.link || "").includes(d))
             );
 
             intel.totalMatches = cleanMatches.length;
             
-            // Append valid matches
-            const validMapped = cleanMatches.slice(0, 8).map(m => ({
+            intel.matches = cleanMatches.slice(0, 8).map(m => ({
                 source_name: m.source || m.title || "Web Result",
                 title: m.title || "External Match",
                 url: m.link || "#",
                 posted_time: "Found Online"
             }));
-            
-            intel.matches = [...intel.matches, ...validMapped];
 
-            // Context Gen Logic
+            // D. CONTEXT GEN ID
             if (intel.ai_generator_name.includes("Unknown") && cleanMatches.length > 0) {
                 const combined = cleanMatches.map(m => (m.title||"") + " " + (m.source||"")).join(" ").toLowerCase();
                 if (combined.includes("midjourney")) intel.ai_generator_name = "Midjourney (Context)";
@@ -164,18 +174,22 @@ export default async function handler(req, res) {
             }
         }
 
-        // FINAL FALLBACK
+        // --- STEP 4: USER FEEDBACK ---
         if (intel.totalMatches === 0 && intel.matches.length === 0) {
+             let reason = "Image not indexed by Google yet.";
+             if (intel.debug.includes("Lens Results: 0")) reason = "Google Lens found 0 visual matches.";
+             if (intel.debug.some(s => s.includes("URL Unreachable"))) reason = "Cloudinary URL is private/blocked.";
+             
              intel.matches.push({
                 source_name: "System",
-                title: "No Matches Found",
+                title: "No Public Matches",
                 url: "#",
-                posted_time: "Your API Key may be exhausted or file is unique."
+                posted_time: reason
             });
         }
 
         return res.status(200).json({
-            service: "osint-debug-pro-v14",
+            service: "osint-final-v15",
             footprintAnalysis: intel,
             timelineIntel: { first_seen: "Analyzed", last_seen: "Just Now" }
         });
