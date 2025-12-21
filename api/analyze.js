@@ -30,13 +30,17 @@ function getDimensions(buffer) {
     return null;
 }
 
-// --- GENERATOR ID ---
+// --- GENERATOR ID (UPDATED) ---
 function identifyGeneratorByRes(w, h) {
     const is = (val, target) => Math.abs(val - target) <= 5;
-    if (is(w, 512) && is(h, 512)) return 'Stable Diffusion v1.5';
-    if ((is(w, 768) && is(h, 640)) || (is(w, 640) && is(h, 768))) return 'Stable Diffusion (Portrait/Landscape)'; 
-    if (is(w, 1024) && is(h, 1024)) return 'SDXL / Midjourney v5';
+    
+    // Midjourney v4 often used 640x640 upscales
+    if (is(w, 512) && is(h, 512)) return 'Stable Diffusion v1.5 / Midjourney v4';
+    if (is(w, 640) && is(h, 640)) return 'Midjourney v4 / Stable Diffusion'; 
+    if ((is(w, 768) && is(h, 640)) || (is(w, 640) && is(h, 768))) return 'Stable Diffusion / Midjourney'; 
+    if (is(w, 1024) && is(h, 1024)) return 'SDXL / Midjourney v5+';
     if (is(w, 1920) && is(h, 1080)) return 'Runway / Pika';
+    
     return "Unknown";
 }
 
@@ -54,7 +58,7 @@ export default async function handler(req, res) {
         ai_generator_name: "Unknown",
         matches: [],
         method: "None",
-        version: "osint-transparency-v18",
+        version: "osint-honest-v19",
         debug: []
     };
 
@@ -62,7 +66,7 @@ export default async function handler(req, res) {
 
     try {
         const isAudio = type === 'audio' || mediaUrl.match(/\.(mp3|wav|ogg)$/i);
-        const filename = mediaUrl.split('/').pop(); // Keep case sensitivity for IDs
+        const filename = mediaUrl.split('/').pop();
         
         // --- STEP 1: DIMS & GEN ID ---
         if (!isAudio) {
@@ -73,7 +77,10 @@ export default async function handler(req, res) {
                 if (dims) {
                     intel.debug.push(`Dims: ${dims.width}x${dims.height}`);
                     const gen = identifyGeneratorByRes(dims.width, dims.height);
-                    if (gen !== "Unknown") intel.ai_generator_name = `${gen} (Resolution Logic)`;
+                    if (gen !== "Unknown") {
+                        // Store the guess, but tag it tentatively
+                        intel.ai_generator_name = `${gen} (Resolution Hint)`;
+                    }
                 }
             } catch (e) { intel.debug.push("Dim Check Failed"); }
         }
@@ -82,7 +89,7 @@ export default async function handler(req, res) {
         if (apiKey) {
             let rawMatches = [];
             
-            // A. VISUAL SEARCH (LENS)
+            // A. VISUAL SEARCH
             if (!isAudio) {
                 try {
                     const lRes = await fetch("https://google.serper.dev/lens", {
@@ -91,20 +98,16 @@ export default async function handler(req, res) {
                         body: JSON.stringify({ url: mediaUrl, gl: "us", hl: "en" })
                     });
                     const lData = await lRes.json();
-                    
                     if (lData.knowledgeGraph) rawMatches.push(lData.knowledgeGraph);
                     if (lData.visualMatches) rawMatches = rawMatches.concat(lData.visualMatches);
-                    
                     if (rawMatches.length > 0) intel.method = "Visual Fingerprint";
                 } catch (e) { intel.debug.push("Lens Error"); }
             }
 
-            // B. TEXT SEARCH (Restored, No Garbage Filter)
+            // B. TEXT SEARCH (Filename)
             if (rawMatches.length === 0) {
                 const cleanName = filename.split('.')[0]; 
-                // We search the raw filename now. If it's a UUID, we want to find it.
                 intel.debug.push(`Text Search: "${cleanName}"`);
-                
                 try {
                     const sRes = await fetch("https://google.serper.dev/search", {
                         method: "POST",
@@ -114,12 +117,11 @@ export default async function handler(req, res) {
                     const sData = await sRes.json();
                     if (sData.organic) rawMatches = rawMatches.concat(sData.organic);
                     if (sData.images) rawMatches = rawMatches.concat(sData.images);
-                    
                     if (rawMatches.length > 0) intel.method = "Filename Trace";
                 } catch (e) { intel.debug.push("Text Search Error"); }
             }
 
-            // C. CLEAN & MAP
+            // C. MAPPING
             const cleanMatches = rawMatches.filter(m => 
                 !IGNORED.some(d => (m.link || "").includes(d))
             );
@@ -133,29 +135,36 @@ export default async function handler(req, res) {
                 posted_time: "Found Online"
             }));
 
-            // D. CONTEXT GEN ID
-            if (intel.ai_generator_name.includes("Unknown") && cleanMatches.length > 0) {
+            // D. CONTEXT GEN ID (Overwrites Resolution Hint if matches found)
+            if (cleanMatches.length > 0) {
                 const combined = cleanMatches.map(m => (m.title||"") + " " + (m.source||"")).join(" ").toLowerCase();
-                if (combined.includes("midjourney")) intel.ai_generator_name = "Midjourney (Context)";
-                else if (combined.includes("stable diffusion")) intel.ai_generator_name = "Stable Diffusion (Context)";
+                if (combined.includes("midjourney")) intel.ai_generator_name = "Midjourney (Verified Context)";
+                else if (combined.includes("stable diffusion")) intel.ai_generator_name = "Stable Diffusion (Verified Context)";
+                else if (combined.includes("dall-e")) intel.ai_generator_name = "DALL-E (Verified Context)";
+            } 
+            else {
+                // IMPORTANT: If 0 matches, reset the name to "Unknown" to avoid lying
+                // unless we are VERY sure (resolution hint is weak evidence alone)
+                if (intel.ai_generator_name.includes("Resolution Hint")) {
+                    intel.ai_generator_name = "Unknown (API Blocked - Verify Manually)";
+                }
             }
         }
 
-        // --- STEP 3: THE TRANSPARENCY FALLBACK ---
+        // --- STEP 3: HONEST FALLBACK ---
         if (intel.totalMatches === 0) {
-             // If automation fails, give the user the tool to verify
              const lensUrl = `https://lens.google.com/uploadbyurl?url=${encodeURIComponent(mediaUrl)}`;
              
              intel.matches.push({
                 source_name: "Google Lens (Manual Check)",
-                title: "Click to Verify on Google Lens",
+                title: "View Actual Results (API Blocked)",
                 url: lensUrl,
-                posted_time: "API found 0 matches. Click to double-check."
+                posted_time: "Google API cannot read this Cloudinary URL. Click here to see the real matches."
             });
         }
 
         return res.status(200).json({
-            service: "osint-transparency-v18",
+            service: "osint-honest-v19",
             footprintAnalysis: intel,
             timelineIntel: { first_seen: "Analyzed", last_seen: "Just Now" }
         });
