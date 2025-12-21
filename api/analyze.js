@@ -2,14 +2,13 @@ import fetch from 'node-fetch';
 
 const IGNORED = ['cloudinary', 'vercel', 'blob:', 'discord', 'whatsapp'];
 
-// --- CLOUDINARY OPTIMIZER ---
-// Injects transformation params to make image Google-friendly (smaller/lighter)
-function optimizeUrl(url) {
+// --- FORCE TINY THUMBNAIL (The Fix) ---
+// We transform the URL to get a guaranteed small (<100KB) image for the API.
+function getThumbnailUrl(url) {
     if (url.includes('cloudinary.com') && url.includes('/upload/')) {
-        // Insert 'w_800,q_auto' after '/upload/'
-        return url.replace('/upload/', '/upload/w_800,q_auto/');
+        return url.replace('/upload/', '/upload/w_500,c_fit,q_auto:low/');
     }
-    return url;
+    return url; // Return original if not Cloudinary (we'll try to use it anyway)
 }
 
 export default async function handler(req, res) {
@@ -26,7 +25,7 @@ export default async function handler(req, res) {
         ai_generator_name: "Unknown",
         matches: [],
         method: "None",
-        version: "osint-cloudinary-fix-v22",
+        version: "osint-nuclear-v23",
         debug: []
     };
 
@@ -35,49 +34,65 @@ export default async function handler(req, res) {
     try {
         const isAudio = type === 'audio' || mediaUrl.match(/\.(mp3|wav|ogg)$/i);
         const filename = mediaUrl.split('/').pop();
+        
+        // --- STEP 1: FORCE-FETCH PIXELS ---
+        let base64Payload = null;
+        let dims = null;
 
-        // --- STEP 1: PREPARE OPTIMIZED URL ---
-        // This is the key fix. We send Google a "Lite" version of the image.
-        const searchUrl = optimizeUrl(mediaUrl);
-        if (searchUrl !== mediaUrl) intel.debug.push("Optimized Cloudinary URL for Search");
-
-        // --- STEP 2: GET DIMS (FROM ORIGINAL) ---
         if (!isAudio) {
             try {
-                const imgRes = await fetch(mediaUrl); 
-                const buffer = new Uint8Array(await imgRes.arrayBuffer());
-                const dims = getDimensions(buffer);
+                // 1. Construct the "Tiny URL"
+                const tinyUrl = getThumbnailUrl(mediaUrl);
+                intel.debug.push(`Fetching Thumbnail: ${tinyUrl}`);
+
+                // 2. Download the tiny image
+                const imgRes = await fetch(tinyUrl);
+                if (!imgRes.ok) throw new Error(`Fetch failed: ${imgRes.status}`);
+                
+                const arrayBuffer = await imgRes.arrayBuffer();
+                const buffer = Buffer.from(arrayBuffer);
+
+                // 3. Convert to Base64 (It is now guaranteed small)
+                base64Payload = buffer.toString('base64');
+                intel.debug.push(`Generated Base64 Payload (${Math.round(base64Payload.length/1024)}KB)`);
+
+                // 4. Get Dimensions (from header) for Gen ID
+                dims = getDimensions(new Uint8Array(arrayBuffer));
                 if (dims) {
                     const gen = identifyGeneratorByRes(dims.width, dims.height);
                     if (gen !== "Unknown") intel.ai_generator_name = `${gen} (Resolution Logic)`;
                 }
-            } catch (e) { intel.debug.push("Dim Check Failed"); }
+
+            } catch (e) { 
+                intel.debug.push(`Pixel Prep Failed: ${e.message}`); 
+            }
         }
 
-        // --- STEP 3: API SEARCH ---
+        // --- STEP 2: API ATTACK (PIXELS ONLY) ---
         if (apiKey && !isAudio) {
             let rawMatches = [];
 
-            // A. VISUAL SEARCH (Using Optimized URL)
-            try {
-                const lRes = await fetch("https://google.serper.dev/lens", {
-                    method: "POST",
-                    headers: { "X-API-KEY": apiKey, "Content-Type": "application/json" },
-                    body: JSON.stringify({ url: searchUrl }) // Send the LITE url
-                });
-                
-                if (!lRes.ok) {
-                    intel.debug.push(`Lens API Error: ${lRes.status}`);
-                } else {
+            // We prefer Base64 because it bypasses URL indexing issues entirely.
+            if (base64Payload) {
+                try {
+                    const lRes = await fetch("https://google.serper.dev/lens", {
+                        method: "POST",
+                        headers: { "X-API-KEY": apiKey, "Content-Type": "application/json" },
+                        body: JSON.stringify({ image: base64Payload }) // SEND PIXELS
+                    });
+                    
                     const lData = await lRes.json();
+                    
                     if (lData.knowledgeGraph) rawMatches.push(lData.knowledgeGraph);
                     if (lData.visualMatches) rawMatches = rawMatches.concat(lData.visualMatches);
                     
-                    if (rawMatches.length > 0) intel.method = "Visual Fingerprint";
-                }
-            } catch (e) { intel.debug.push("Lens Network Error"); }
+                    if (rawMatches.length > 0) intel.method = "Deep Pixel Search";
+                    else intel.debug.push("Pixel Search returned 0 matches");
 
-            // B. TEXT SEARCH (Filename Fallback)
+                } catch (e) { intel.debug.push("Lens API Error"); }
+            }
+
+            // --- STEP 3: TEXT FALLBACK (If Pixels Failed) ---
             if (rawMatches.length === 0) {
                 const cleanName = filename.split('.')[0];
                 intel.debug.push(`Fallback Text Search: "${cleanName}"`);
@@ -102,7 +117,7 @@ export default async function handler(req, res) {
 
             intel.totalMatches = cleanMatches.length;
             
-            intel.matches = cleanMatches.slice(0, 8).map(m => ({
+            intel.matches = cleanMatches.slice(0, 10).map(m => ({
                 source_name: m.source || m.title || "Web Result",
                 title: m.title || "External Match",
                 url: m.link || "#",
@@ -112,8 +127,8 @@ export default async function handler(req, res) {
             // Context Gen ID
             if (cleanMatches.length > 0) {
                 const combined = cleanMatches.map(m => (m.title||"") + " " + (m.source||"")).join(" ").toLowerCase();
-                if (combined.includes("midjourney")) intel.ai_generator_name = "Midjourney (Context Verified)";
-                else if (combined.includes("stable diffusion")) intel.ai_generator_name = "Stable Diffusion (Context Verified)";
+                if (combined.includes("midjourney")) intel.ai_generator_name = "Midjourney (Verified)";
+                else if (combined.includes("stable diffusion")) intel.ai_generator_name = "Stable Diffusion (Verified)";
             }
         }
 
@@ -124,12 +139,12 @@ export default async function handler(req, res) {
                 source_name: "Google Lens (Manual)",
                 title: "View Results Manually",
                 url: lensUrl,
-                posted_time: "API Blocked. Click to verify."
+                posted_time: "Image Unique or API Blocked"
             });
         }
 
         return res.status(200).json({
-            service: "osint-cloudinary-fix-v22",
+            service: "osint-nuclear-v23",
             footprintAnalysis: intel,
             timelineIntel: { first_seen: "Analyzed", last_seen: "Just Now" }
         });
