@@ -2,6 +2,16 @@ import fetch from 'node-fetch';
 
 const IGNORED = ['cloudinary', 'vercel', 'blob:', 'discord', 'whatsapp'];
 
+// --- CLOUDINARY OPTIMIZER ---
+// Injects transformation params to make image Google-friendly (smaller/lighter)
+function optimizeUrl(url) {
+    if (url.includes('cloudinary.com') && url.includes('/upload/')) {
+        // Insert 'w_800,q_auto' after '/upload/'
+        return url.replace('/upload/', '/upload/w_800,q_auto/');
+    }
+    return url;
+}
+
 export default async function handler(req, res) {
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'POST');
@@ -16,7 +26,7 @@ export default async function handler(req, res) {
         ai_generator_name: "Unknown",
         matches: [],
         method: "None",
-        version: "osint-global-v21",
+        version: "osint-cloudinary-fix-v22",
         debug: []
     };
 
@@ -24,77 +34,75 @@ export default async function handler(req, res) {
 
     try {
         const isAudio = type === 'audio' || mediaUrl.match(/\.(mp3|wav|ogg)$/i);
-        
-        // --- PREP: CONVERT TO BASE64 (For Strategy B) ---
-        let base64Image = null;
+        const filename = mediaUrl.split('/').pop();
+
+        // --- STEP 1: PREPARE OPTIMIZED URL ---
+        // This is the key fix. We send Google a "Lite" version of the image.
+        const searchUrl = optimizeUrl(mediaUrl);
+        if (searchUrl !== mediaUrl) intel.debug.push("Optimized Cloudinary URL for Search");
+
+        // --- STEP 2: GET DIMS (FROM ORIGINAL) ---
         if (!isAudio) {
             try {
-                const imgRes = await fetch(mediaUrl);
-                const arrayBuffer = await imgRes.arrayBuffer();
-                const buffer = Buffer.from(arrayBuffer);
-                base64Image = buffer.toString('base64');
-                
-                // Quick Dimension Check for Generator ID
-                const dims = getDimensions(new Uint8Array(arrayBuffer));
+                const imgRes = await fetch(mediaUrl); 
+                const buffer = new Uint8Array(await imgRes.arrayBuffer());
+                const dims = getDimensions(buffer);
                 if (dims) {
                     const gen = identifyGeneratorByRes(dims.width, dims.height);
                     if (gen !== "Unknown") intel.ai_generator_name = `${gen} (Resolution Logic)`;
                 }
-            } catch (e) { intel.debug.push("Image Prep Failed"); }
+            } catch (e) { intel.debug.push("Dim Check Failed"); }
         }
 
-        // --- EXECUTION: THE DOUBLE TAP ---
+        // --- STEP 3: API SEARCH ---
         if (apiKey && !isAudio) {
             let rawMatches = [];
 
-            // We run TWO searches in parallel to maximize chances
-            const searches = [
-                // STRATEGY A: URL Search (Global)
-                fetch("https://google.serper.dev/lens", {
+            // A. VISUAL SEARCH (Using Optimized URL)
+            try {
+                const lRes = await fetch("https://google.serper.dev/lens", {
                     method: "POST",
                     headers: { "X-API-KEY": apiKey, "Content-Type": "application/json" },
-                    body: JSON.stringify({ url: mediaUrl }) // No 'gl' param = Global
-                }).then(r => r.json().then(data => ({ type: 'URL', data }))),
-
-                // STRATEGY B: Pixel Search (Global)
-                base64Image ? fetch("https://google.serper.dev/lens", {
-                    method: "POST",
-                    headers: { "X-API-KEY": apiKey, "Content-Type": "application/json" },
-                    body: JSON.stringify({ image: base64Image }) // No 'gl' param
-                }).then(r => r.json().then(data => ({ type: 'PIXEL', data }))) : Promise.resolve(null)
-            ];
-
-            const results = await Promise.all(searches);
-
-            // Process Results
-            results.forEach(res => {
-                if (!res || !res.data) return;
+                    body: JSON.stringify({ url: searchUrl }) // Send the LITE url
+                });
                 
-                // Capture Errors
-                if (res.data.error) intel.debug.push(`${res.type} Error: ${JSON.stringify(res.data.error)}`);
-                
-                const data = res.data;
-                let count = 0;
-                
-                if (data.knowledgeGraph) { rawMatches.push(data.knowledgeGraph); count++; }
-                if (data.visualMatches) { rawMatches = rawMatches.concat(data.visualMatches); count += data.visualMatches.length; }
-                
-                if (count > 0) intel.debug.push(`${res.type} found ${count} matches`);
-            });
+                if (!lRes.ok) {
+                    intel.debug.push(`Lens API Error: ${lRes.status}`);
+                } else {
+                    const lData = await lRes.json();
+                    if (lData.knowledgeGraph) rawMatches.push(lData.knowledgeGraph);
+                    if (lData.visualMatches) rawMatches = rawMatches.concat(lData.visualMatches);
+                    
+                    if (rawMatches.length > 0) intel.method = "Visual Fingerprint";
+                }
+            } catch (e) { intel.debug.push("Lens Network Error"); }
 
-            if (rawMatches.length > 0) intel.method = "Global Visual Fingerprint";
+            // B. TEXT SEARCH (Filename Fallback)
+            if (rawMatches.length === 0) {
+                const cleanName = filename.split('.')[0];
+                intel.debug.push(`Fallback Text Search: "${cleanName}"`);
+                try {
+                    const sRes = await fetch("https://google.serper.dev/search", {
+                        method: "POST",
+                        headers: { "X-API-KEY": apiKey, "Content-Type": "application/json" },
+                        body: JSON.stringify({ q: cleanName })
+                    });
+                    const sData = await sRes.json();
+                    if (sData.organic) rawMatches = rawMatches.concat(sData.organic);
+                    if (sData.images) rawMatches = rawMatches.concat(sData.images);
+                    
+                    if (rawMatches.length > 0) intel.method = "Filename Trace";
+                } catch (e) { intel.debug.push("Text Search Error"); }
+            }
 
-            // --- FILTERING ---
-            // Remove duplicates based on URL
-            const uniqueMatches = Array.from(new Map(rawMatches.map(m => [m.link, m])).values());
-
-            const cleanMatches = uniqueMatches.filter(m => 
+            // --- PROCESSING ---
+            const cleanMatches = rawMatches.filter(m => 
                 !IGNORED.some(d => (m.link || "").includes(d))
             );
 
             intel.totalMatches = cleanMatches.length;
             
-            intel.matches = cleanMatches.slice(0, 10).map(m => ({
+            intel.matches = cleanMatches.slice(0, 8).map(m => ({
                 source_name: m.source || m.title || "Web Result",
                 title: m.title || "External Match",
                 url: m.link || "#",
@@ -109,19 +117,19 @@ export default async function handler(req, res) {
             }
         }
 
-        // --- FINAL FALLBACK ---
+        // --- STEP 4: FINAL FALLBACK ---
         if (intel.totalMatches === 0) {
             const lensUrl = `https://lens.google.com/uploadbyurl?url=${encodeURIComponent(mediaUrl)}`;
             intel.matches.push({
                 source_name: "Google Lens (Manual)",
-                title: "View Results (Manual Check)",
+                title: "View Results Manually",
                 url: lensUrl,
-                posted_time: "0 API Matches. Click to verify."
+                posted_time: "API Blocked. Click to verify."
             });
         }
 
         return res.status(200).json({
-            service: "osint-global-v21",
+            service: "osint-cloudinary-fix-v22",
             footprintAnalysis: intel,
             timelineIntel: { first_seen: "Analyzed", last_seen: "Just Now" }
         });
