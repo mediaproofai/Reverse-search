@@ -40,15 +40,6 @@ function identifyGeneratorByRes(w, h) {
     return "Unknown";
 }
 
-// --- GARBAGE DETECTOR ---
-// Returns TRUE if the string looks like a random ID (e.g. "ghgxy1qbxyzwjvbbox7u")
-function isGarbage(text) {
-    if (!text) return true;
-    if (text.length > 12 && !text.includes(' ') && !text.includes('-') && !text.includes('_')) return true; // Long single string
-    if (text.match(/[0-9]{5,}/) && text.match(/[a-z]{5,}/)) return true; // Mixed long alphanumerics
-    return false;
-}
-
 export default async function handler(req, res) {
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'POST');
@@ -63,7 +54,7 @@ export default async function handler(req, res) {
         ai_generator_name: "Unknown",
         matches: [],
         method: "None",
-        version: "osint-integrity-v17",
+        version: "osint-transparency-v18",
         debug: []
     };
 
@@ -71,9 +62,9 @@ export default async function handler(req, res) {
 
     try {
         const isAudio = type === 'audio' || mediaUrl.match(/\.(mp3|wav|ogg)$/i);
-        const filename = mediaUrl.split('/').pop().toLowerCase();
+        const filename = mediaUrl.split('/').pop(); // Keep case sensitivity for IDs
         
-        // --- STEP 1: DIMS & GEN ID (Always Run) ---
+        // --- STEP 1: DIMS & GEN ID ---
         if (!isAudio) {
             try {
                 const imgRes = await fetch(mediaUrl); 
@@ -91,7 +82,7 @@ export default async function handler(req, res) {
         if (apiKey) {
             let rawMatches = [];
             
-            // A. VISUAL SEARCH (LENS) - The only source of truth for images
+            // A. VISUAL SEARCH (LENS)
             if (!isAudio) {
                 try {
                     const lRes = await fetch("https://google.serper.dev/lens", {
@@ -108,28 +99,24 @@ export default async function handler(req, res) {
                 } catch (e) { intel.debug.push("Lens Error"); }
             }
 
-            // B. TEXT SEARCH (Selective)
-            // Only run if Visual Failed AND Filename looks human-readable
+            // B. TEXT SEARCH (Restored, No Garbage Filter)
             if (rawMatches.length === 0) {
-                const cleanName = filename.split('.')[0].replace(/[-_]/g, ' '); // simple cleanup
+                const cleanName = filename.split('.')[0]; 
+                // We search the raw filename now. If it's a UUID, we want to find it.
+                intel.debug.push(`Text Search: "${cleanName}"`);
                 
-                if (!isGarbage(cleanName)) {
-                    intel.debug.push(`Text Search: "${cleanName}"`);
-                    try {
-                        const sRes = await fetch("https://google.serper.dev/search", {
-                            method: "POST",
-                            headers: { "X-API-KEY": apiKey, "Content-Type": "application/json" },
-                            body: JSON.stringify({ q: cleanName, gl: "us", hl: "en" })
-                        });
-                        const sData = await sRes.json();
-                        if (sData.organic) rawMatches = rawMatches.concat(sData.organic);
-                        if (sData.images) rawMatches = rawMatches.concat(sData.images);
-                        
-                        if (rawMatches.length > 0) intel.method = "Filename Trace";
-                    } catch (e) { intel.debug.push("Text Search Error"); }
-                } else {
-                    intel.debug.push("Skipped Text Search (Garbage Filename)");
-                }
+                try {
+                    const sRes = await fetch("https://google.serper.dev/search", {
+                        method: "POST",
+                        headers: { "X-API-KEY": apiKey, "Content-Type": "application/json" },
+                        body: JSON.stringify({ q: cleanName, gl: "us", hl: "en" })
+                    });
+                    const sData = await sRes.json();
+                    if (sData.organic) rawMatches = rawMatches.concat(sData.organic);
+                    if (sData.images) rawMatches = rawMatches.concat(sData.images);
+                    
+                    if (rawMatches.length > 0) intel.method = "Filename Trace";
+                } catch (e) { intel.debug.push("Text Search Error"); }
             }
 
             // C. CLEAN & MAP
@@ -154,18 +141,21 @@ export default async function handler(req, res) {
             }
         }
 
-        // --- STEP 3: FALLBACK ---
+        // --- STEP 3: THE TRANSPARENCY FALLBACK ---
         if (intel.totalMatches === 0) {
+             // If automation fails, give the user the tool to verify
+             const lensUrl = `https://lens.google.com/uploadbyurl?url=${encodeURIComponent(mediaUrl)}`;
+             
              intel.matches.push({
-                source_name: "System",
-                title: "No Public Matches",
-                url: "#",
-                posted_time: "Unique File"
+                source_name: "Google Lens (Manual Check)",
+                title: "Click to Verify on Google Lens",
+                url: lensUrl,
+                posted_time: "API found 0 matches. Click to double-check."
             });
         }
 
         return res.status(200).json({
-            service: "osint-integrity-v17",
+            service: "osint-transparency-v18",
             footprintAnalysis: intel,
             timelineIntel: { first_seen: "Analyzed", last_seen: "Just Now" }
         });
