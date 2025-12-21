@@ -40,6 +40,15 @@ function identifyGeneratorByRes(w, h) {
     return "Unknown";
 }
 
+// --- GARBAGE DETECTOR ---
+// Returns TRUE if the string looks like a random ID (e.g. "ghgxy1qbxyzwjvbbox7u")
+function isGarbage(text) {
+    if (!text) return true;
+    if (text.length > 12 && !text.includes(' ') && !text.includes('-') && !text.includes('_')) return true; // Long single string
+    if (text.match(/[0-9]{5,}/) && text.match(/[a-z]{5,}/)) return true; // Mixed long alphanumerics
+    return false;
+}
+
 export default async function handler(req, res) {
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'POST');
@@ -54,7 +63,7 @@ export default async function handler(req, res) {
         ai_generator_name: "Unknown",
         matches: [],
         method: "None",
-        version: "osint-unleashed-v16",
+        version: "osint-integrity-v17",
         debug: []
     };
 
@@ -63,28 +72,26 @@ export default async function handler(req, res) {
     try {
         const isAudio = type === 'audio' || mediaUrl.match(/\.(mp3|wav|ogg)$/i);
         const filename = mediaUrl.split('/').pop().toLowerCase();
-        let dimsStr = "";
-
-        // --- STEP 1: DIMS & GEN ID ---
+        
+        // --- STEP 1: DIMS & GEN ID (Always Run) ---
         if (!isAudio) {
             try {
                 const imgRes = await fetch(mediaUrl); 
                 const buffer = new Uint8Array(await imgRes.arrayBuffer());
                 const dims = getDimensions(buffer);
                 if (dims) {
-                    dimsStr = `${dims.width}x${dims.height}`;
-                    intel.debug.push(`Dims: ${dimsStr}`);
+                    intel.debug.push(`Dims: ${dims.width}x${dims.height}`);
                     const gen = identifyGeneratorByRes(dims.width, dims.height);
                     if (gen !== "Unknown") intel.ai_generator_name = `${gen} (Resolution Logic)`;
                 }
             } catch (e) { intel.debug.push("Dim Check Failed"); }
         }
 
-        // --- STEP 2: API SEARCH (NO FILTERS) ---
+        // --- STEP 2: API SEARCH ---
         if (apiKey) {
             let rawMatches = [];
             
-            // A. LENS (Visual)
+            // A. VISUAL SEARCH (LENS) - The only source of truth for images
             if (!isAudio) {
                 try {
                     const lRes = await fetch("https://google.serper.dev/lens", {
@@ -93,47 +100,39 @@ export default async function handler(req, res) {
                         body: JSON.stringify({ url: mediaUrl, gl: "us", hl: "en" })
                     });
                     const lData = await lRes.json();
+                    
+                    if (lData.knowledgeGraph) rawMatches.push(lData.knowledgeGraph);
                     if (lData.visualMatches) rawMatches = rawMatches.concat(lData.visualMatches);
+                    
                     if (rawMatches.length > 0) intel.method = "Visual Fingerprint";
                 } catch (e) { intel.debug.push("Lens Error"); }
             }
 
-            // B. TEXT (Filename - UNLEASHED)
+            // B. TEXT SEARCH (Selective)
+            // Only run if Visual Failed AND Filename looks human-readable
             if (rawMatches.length === 0) {
-                const cleanName = filename.split('.')[0]; // Search raw ID: "dbxbspr..."
-                intel.debug.push(`Text Search: "${cleanName}"`);
+                const cleanName = filename.split('.')[0].replace(/[-_]/g, ' '); // simple cleanup
                 
-                try {
-                    const sRes = await fetch("https://google.serper.dev/search", {
-                        method: "POST",
-                        headers: { "X-API-KEY": apiKey, "Content-Type": "application/json" },
-                        body: JSON.stringify({ q: cleanName, gl: "us", hl: "en" })
-                    });
-                    const sData = await sRes.json();
-                    if (sData.organic) rawMatches = rawMatches.concat(sData.organic);
-                    if (sData.images) rawMatches = rawMatches.concat(sData.images);
-                    if (rawMatches.length > 0) intel.method = "Filename Hash Trace";
-                } catch (e) { intel.debug.push("Text Search Error"); }
+                if (!isGarbage(cleanName)) {
+                    intel.debug.push(`Text Search: "${cleanName}"`);
+                    try {
+                        const sRes = await fetch("https://google.serper.dev/search", {
+                            method: "POST",
+                            headers: { "X-API-KEY": apiKey, "Content-Type": "application/json" },
+                            body: JSON.stringify({ q: cleanName, gl: "us", hl: "en" })
+                        });
+                        const sData = await sRes.json();
+                        if (sData.organic) rawMatches = rawMatches.concat(sData.organic);
+                        if (sData.images) rawMatches = rawMatches.concat(sData.images);
+                        
+                        if (rawMatches.length > 0) intel.method = "Filename Trace";
+                    } catch (e) { intel.debug.push("Text Search Error"); }
+                } else {
+                    intel.debug.push("Skipped Text Search (Garbage Filename)");
+                }
             }
 
-            // C. HAIL MARY (Resolution Search)
-            // If everything else failed, search for the resolution itself
-            if (rawMatches.length === 0 && dimsStr) {
-                const query = `"${dimsStr}" AI image`;
-                intel.debug.push(`Hail Mary Search: ${query}`);
-                try {
-                    const hRes = await fetch("https://google.serper.dev/search", {
-                        method: "POST",
-                        headers: { "X-API-KEY": apiKey, "Content-Type": "application/json" },
-                        body: JSON.stringify({ q: query, gl: "us", hl: "en" })
-                    });
-                    const hData = await hRes.json();
-                    if (hData.organic) rawMatches = rawMatches.concat(hData.organic);
-                    if (rawMatches.length > 0) intel.method = "Resolution Footprint";
-                } catch (e) {}
-            }
-
-            // D. MAPPING (Minimal Filtering)
+            // C. CLEAN & MAP
             const cleanMatches = rawMatches.filter(m => 
                 !IGNORED.some(d => (m.link || "").includes(d))
             );
@@ -147,7 +146,7 @@ export default async function handler(req, res) {
                 posted_time: "Found Online"
             }));
 
-            // E. CONTEXT GEN ID
+            // D. CONTEXT GEN ID
             if (intel.ai_generator_name.includes("Unknown") && cleanMatches.length > 0) {
                 const combined = cleanMatches.map(m => (m.title||"") + " " + (m.source||"")).join(" ").toLowerCase();
                 if (combined.includes("midjourney")) intel.ai_generator_name = "Midjourney (Context)";
@@ -166,7 +165,7 @@ export default async function handler(req, res) {
         }
 
         return res.status(200).json({
-            service: "osint-unleashed-v16",
+            service: "osint-integrity-v17",
             footprintAnalysis: intel,
             timelineIntel: { first_seen: "Analyzed", last_seen: "Just Now" }
         });
