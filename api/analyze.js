@@ -16,7 +16,7 @@ export default async function handler(req, res) {
         ai_generator_name: "Unknown",
         matches: [],
         method: "None",
-        version: "osint-pixel-mode-v20",
+        version: "osint-global-v21",
         debug: []
     };
 
@@ -25,73 +25,76 @@ export default async function handler(req, res) {
     try {
         const isAudio = type === 'audio' || mediaUrl.match(/\.(mp3|wav|ogg)$/i);
         
-        // --- STEP 1: DOWNLOAD & CONVERT TO BASE64 ---
-        // We do this to bypass the "URL not indexed" issue.
-        // We send the RAW PIXELS to Google.
+        // --- PREP: CONVERT TO BASE64 (For Strategy B) ---
         let base64Image = null;
-        let dims = null;
-
         if (!isAudio) {
             try {
                 const imgRes = await fetch(mediaUrl);
                 const arrayBuffer = await imgRes.arrayBuffer();
                 const buffer = Buffer.from(arrayBuffer);
+                base64Image = buffer.toString('base64');
                 
-                // Safety: Only use Base64 if image is under 2MB (Serper Limit)
-                if (buffer.length < 2000000) {
-                    base64Image = buffer.toString('base64');
-                    intel.debug.push(`Converted to Base64 (${Math.round(buffer.length/1024)}KB)`);
-                } else {
-                    intel.debug.push("File too large for Base64, using URL");
-                }
-
-                // Get Dims (Manual Parse)
-                dims = getDimensions(new Uint8Array(arrayBuffer));
+                // Quick Dimension Check for Generator ID
+                const dims = getDimensions(new Uint8Array(arrayBuffer));
                 if (dims) {
                     const gen = identifyGeneratorByRes(dims.width, dims.height);
                     if (gen !== "Unknown") intel.ai_generator_name = `${gen} (Resolution Logic)`;
                 }
-            } catch (e) { intel.debug.push("Download Failed: " + e.message); }
+            } catch (e) { intel.debug.push("Image Prep Failed"); }
         }
 
-        // --- STEP 2: API SEARCH (PIXEL MODE) ---
+        // --- EXECUTION: THE DOUBLE TAP ---
         if (apiKey && !isAudio) {
             let rawMatches = [];
 
-            try {
-                const payload = { gl: "us", hl: "en" };
-                
-                // CRITICAL SWITCH: Use 'image' (base64) if available, otherwise 'url'
-                if (base64Image) {
-                    payload.image = base64Image;
-                } else {
-                    payload.url = mediaUrl;
-                }
-
-                const lRes = await fetch("https://google.serper.dev/lens", {
+            // We run TWO searches in parallel to maximize chances
+            const searches = [
+                // STRATEGY A: URL Search (Global)
+                fetch("https://google.serper.dev/lens", {
                     method: "POST",
                     headers: { "X-API-KEY": apiKey, "Content-Type": "application/json" },
-                    body: JSON.stringify(payload)
-                });
-                
-                const lData = await lRes.json();
-                
-                if (lData.knowledgeGraph) rawMatches.push(lData.knowledgeGraph);
-                if (lData.visualMatches) rawMatches = rawMatches.concat(lData.visualMatches);
-                
-                if (rawMatches.length > 0) intel.method = base64Image ? "Deep Pixel Search" : "Visual Fingerprint";
-                else intel.debug.push("Lens returned 0 matches");
+                    body: JSON.stringify({ url: mediaUrl }) // No 'gl' param = Global
+                }).then(r => r.json().then(data => ({ type: 'URL', data }))),
 
-            } catch (e) { intel.debug.push("Lens API Error"); }
+                // STRATEGY B: Pixel Search (Global)
+                base64Image ? fetch("https://google.serper.dev/lens", {
+                    method: "POST",
+                    headers: { "X-API-KEY": apiKey, "Content-Type": "application/json" },
+                    body: JSON.stringify({ image: base64Image }) // No 'gl' param
+                }).then(r => r.json().then(data => ({ type: 'PIXEL', data }))) : Promise.resolve(null)
+            ];
 
-            // --- PROCESSING ---
-            const cleanMatches = rawMatches.filter(m => 
+            const results = await Promise.all(searches);
+
+            // Process Results
+            results.forEach(res => {
+                if (!res || !res.data) return;
+                
+                // Capture Errors
+                if (res.data.error) intel.debug.push(`${res.type} Error: ${JSON.stringify(res.data.error)}`);
+                
+                const data = res.data;
+                let count = 0;
+                
+                if (data.knowledgeGraph) { rawMatches.push(data.knowledgeGraph); count++; }
+                if (data.visualMatches) { rawMatches = rawMatches.concat(data.visualMatches); count += data.visualMatches.length; }
+                
+                if (count > 0) intel.debug.push(`${res.type} found ${count} matches`);
+            });
+
+            if (rawMatches.length > 0) intel.method = "Global Visual Fingerprint";
+
+            // --- FILTERING ---
+            // Remove duplicates based on URL
+            const uniqueMatches = Array.from(new Map(rawMatches.map(m => [m.link, m])).values());
+
+            const cleanMatches = uniqueMatches.filter(m => 
                 !IGNORED.some(d => (m.link || "").includes(d))
             );
 
             intel.totalMatches = cleanMatches.length;
             
-            intel.matches = cleanMatches.slice(0, 8).map(m => ({
+            intel.matches = cleanMatches.slice(0, 10).map(m => ({
                 source_name: m.source || m.title || "Web Result",
                 title: m.title || "External Match",
                 url: m.link || "#",
@@ -106,19 +109,19 @@ export default async function handler(req, res) {
             }
         }
 
-        // --- STEP 3: FINAL FALLBACK ---
+        // --- FINAL FALLBACK ---
         if (intel.totalMatches === 0) {
             const lensUrl = `https://lens.google.com/uploadbyurl?url=${encodeURIComponent(mediaUrl)}`;
             intel.matches.push({
                 source_name: "Google Lens (Manual)",
-                title: "View Results Manually",
+                title: "View Results (Manual Check)",
                 url: lensUrl,
-                posted_time: "0 API Matches"
+                posted_time: "0 API Matches. Click to verify."
             });
         }
 
         return res.status(200).json({
-            service: "osint-pixel-mode-v20",
+            service: "osint-global-v21",
             footprintAnalysis: intel,
             timelineIntel: { first_seen: "Analyzed", last_seen: "Just Now" }
         });
@@ -128,7 +131,7 @@ export default async function handler(req, res) {
     }
 }
 
-// --- HELPERS (Keep these at the bottom) ---
+// --- HELPERS ---
 function getDimensions(buffer) {
     try {
         if (buffer[0] === 0x89 && buffer[1] === 0x50) { 
