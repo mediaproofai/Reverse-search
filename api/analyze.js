@@ -21,11 +21,13 @@ function getDimensions(buffer) {
     return null;
 }
 
+// --- GENERATOR ID (Wider Tolerance for SDXL) ---
 function identifyGeneratorByRes(w, h) {
-    const is = (val, target) => Math.abs(val - target) <= 5;
+    const is = (val, target) => Math.abs(val - target) <= 10; // Widen tolerance to 10px
     if (is(w, 512) && is(h, 512)) return 'Stable Diffusion v1.5';
     if (is(w, 640) && is(h, 640)) return 'Stable Diffusion / Midjourney v4'; 
     if ((is(w, 768) && is(h, 640)) || (is(w, 640) && is(h, 768))) return 'Stable Diffusion (Portrait/Landscape)'; 
+    if ((is(w, 768) && is(h, 1024)) || (is(w, 768) && is(h, 1000))) return 'SDXL (Portrait)'; // Fix for your 769x1000
     if (is(w, 1024) && is(h, 1024)) return 'SDXL / Midjourney v5';
     return "Unknown";
 }
@@ -44,7 +46,7 @@ export default async function handler(req, res) {
         ai_generator_name: "Unknown",
         matches: [],
         method: "None",
-        version: "osint-goldilocks-v30",
+        version: "osint-platinum-v31",
         debug: []
     };
 
@@ -52,24 +54,24 @@ export default async function handler(req, res) {
 
     try {
         const isAudio = type === 'audio' || mediaUrl.match(/\.(mp3|wav|ogg)$/i);
-        
-        // --- PREP: GOLDILOCKS IMAGE ---
+        const filename = mediaUrl.split('/').pop();
+
+        // --- PREP: TINY IMAGE FOR API ---
         let base64Payload = null;
         if (!isAudio) {
             try {
-                // 1. Force 1000px width.
-                // This preserves enough detail for Lens (unlike 500px)
-                // But keeps size under 300KB (unlike Original)
+                // Force a tiny, low-quality jpg (600px, q_60). 
+                // This ensures the payload is small (~40KB) and never times out.
                 let fetchUrl = mediaUrl;
                 if (mediaUrl.includes('cloudinary')) {
-                    fetchUrl = mediaUrl.replace('/upload/', '/upload/w_1000,q_auto/');
+                    fetchUrl = mediaUrl.replace('/upload/', '/upload/w_600,q_60/');
                 }
 
                 const imgRes = await fetch(fetchUrl);
                 const arrayBuffer = await imgRes.arrayBuffer();
                 const buffer = Buffer.from(arrayBuffer);
                 
-                // 2. Parse Dims (for Gen ID)
+                // Get Metadata (from this buffer or original, doesn't matter for ID)
                 const dims = getDimensions(new Uint8Array(arrayBuffer));
                 if (dims) {
                     intel.debug.push(`Dims: ${dims.width}x${dims.height}`);
@@ -77,49 +79,82 @@ export default async function handler(req, res) {
                     if (gen !== "Unknown") intel.ai_generator_name = `${gen} (Resolution Logic)`;
                 }
 
-                // 3. Convert to Raw Base64 (No Prefix)
                 base64Payload = buffer.toString('base64');
-                intel.debug.push(`Payload Size: ${Math.round(base64Payload.length/1024)}KB`);
+                intel.debug.push(`Payload: ${Math.round(base64Payload.length/1024)}KB`);
 
             } catch (e) { intel.debug.push(`Prep Error: ${e.message}`); }
         }
 
-        // --- EXECUTION: JSON BASE64 ---
-        if (apiKey && !isAudio && base64Payload) {
+        if (apiKey && !isAudio) {
+            
+            // --- PARALLEL EXECUTION (Visual + Text) ---
+            const searches = [];
+
+            // 1. VISUAL SEARCH (Lens API)
+            if (base64Payload) {
+                searches.push(
+                    fetch("https://google.serper.dev/lens", {
+                        method: "POST",
+                        headers: { "X-API-KEY": apiKey, "Content-Type": "application/json" },
+                        body: JSON.stringify({ image: base64Payload }) // No 'gl' param, let it float
+                    })
+                    .then(r => r.json())
+                    .then(data => ({ type: 'Visual', data }))
+                    .catch(e => ({ type: 'Visual', error: e.message }))
+                );
+            }
+
+            // 2. TEXT SEARCH (Filename on Google Images)
+            const cleanName = filename.split('.')[0];
+            if (cleanName.length > 5) { // Only if name is significant
+                searches.push(
+                    fetch("https://google.serper.dev/search", {
+                        method: "POST",
+                        headers: { "X-API-KEY": apiKey, "Content-Type": "application/json" },
+                        body: JSON.stringify({ q: cleanName, type: "images" }) // Specifically search images
+                    })
+                    .then(r => r.json())
+                    .then(data => ({ type: 'Text', data }))
+                    .catch(e => ({ type: 'Text', error: e.message }))
+                );
+            }
+
+            // Wait for both
+            const results = await Promise.all(searches);
             let rawMatches = [];
 
-            try {
-                // We send Standard JSON. The API expects "image" to be a raw base64 string.
-                const lRes = await fetch("https://google.serper.dev/lens", {
-                    method: "POST",
-                    headers: { 
-                        "X-API-KEY": apiKey, 
-                        "Content-Type": "application/json"
-                    },
-                    body: JSON.stringify({ 
-                        image: base64Payload,
-                        gl: "us", 
-                        hl: "en" 
-                    })
-                });
+            results.forEach(res => {
+                if (res.error) {
+                    intel.debug.push(`${res.type} Error: ${res.error}`);
+                    return;
+                }
                 
-                const lData = await lRes.json();
+                const data = res.data;
+                let count = 0;
 
-                // Capture Errors
-                if (lData.error) {
-                    intel.debug.push(`API Error: ${JSON.stringify(lData.error)}`);
-                } else {
-                    if (lData.knowledgeGraph) rawMatches.push(lData.knowledgeGraph);
-                    if (lData.visualMatches) rawMatches = rawMatches.concat(lData.visualMatches);
-                    
-                    if (rawMatches.length > 0) intel.method = "Visual Search (1000px)";
-                    else intel.debug.push("Lens found 0 matches");
+                // Handle Lens Data
+                if (res.type === 'Visual') {
+                    if (data.knowledgeGraph) { rawMatches.push(data.knowledgeGraph); count++; }
+                    if (data.visualMatches) { rawMatches = rawMatches.concat(data.visualMatches); count += data.visualMatches.length; }
                 }
 
-            } catch (e) { intel.debug.push(`Network Error: ${e.message}`); }
+                // Handle Text/Image Data
+                if (res.type === 'Text') {
+                    if (data.images) { rawMatches = rawMatches.concat(data.images); count += data.images.length; }
+                }
+
+                intel.debug.push(`${res.type} found ${count} matches`);
+            });
+
+            if (rawMatches.length > 0) intel.method = "Hybrid (Visual + Text)";
 
             // --- PROCESSING ---
-            const cleanMatches = rawMatches.filter(m => 
+            // Deduplicate by URL
+            const uniqueMap = new Map();
+            rawMatches.forEach(m => uniqueMap.set(m.link, m));
+            const uniqueMatches = Array.from(uniqueMap.values());
+
+            const cleanMatches = uniqueMatches.filter(m => 
                 !IGNORED.some(d => (m.link || "").includes(d))
             );
 
@@ -144,14 +179,14 @@ export default async function handler(req, res) {
         if (intel.totalMatches === 0) {
             intel.matches.push({
                 source_name: "Google Lens (Manual)",
-                title: "No API Matches - Click to Verify",
+                title: "No matches found. Click to Verify.",
                 url: `https://lens.google.com/uploadbyurl?url=${encodeURIComponent(mediaUrl)}`,
-                posted_time: "Image might be unique or private"
+                posted_time: "Manual Check Required"
             });
         }
 
         return res.status(200).json({
-            service: "osint-goldilocks-v30",
+            service: "osint-platinum-v31",
             footprintAnalysis: intel,
             timelineIntel: { first_seen: "Analyzed", last_seen: "Just Now" }
         });
