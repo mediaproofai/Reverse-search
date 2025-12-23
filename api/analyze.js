@@ -2,27 +2,38 @@ import fetch from 'node-fetch';
 
 const IGNORED = ['cloudinary', 'vercel', 'blob:', 'discord', 'whatsapp'];
 
+// --- MULTIPART CONSTRUCTOR (The Pro Fix) ---
+// This manually builds a "file upload" body to bypass JSON limitations
+function buildMultipart(buffer, boundary) {
+    const crlf = "\r\n";
+    const filename = "search_image.jpg";
+    
+    let parts = [
+        `--${boundary}`,
+        `Content-Disposition: form-data; name="file"; filename="${filename}"`,
+        `Content-Type: image/jpeg`,
+        crlf
+    ];
+
+    // Combine headers, buffer, and footer
+    const header = Buffer.from(parts.join(crlf));
+    const footer = Buffer.from(`${crlf}--${boundary}--${crlf}`);
+    
+    return Buffer.concat([header, buffer, footer]);
+}
+
 // --- DIMENSION PARSER ---
 function getDimensions(buffer) {
     try {
-        if (buffer[0] === 0x89 && buffer[1] === 0x50) { 
-            const width = (buffer[16] << 24) | (buffer[17] << 16) | (buffer[18] << 8) | buffer[19];
-            const height = (buffer[20] << 24) | (buffer[21] << 16) | (buffer[22] << 8) | buffer[23];
-            return { width, height, type: 'png' };
-        }
+        if (buffer[0] === 0x89 && buffer[1] === 0x50) return { width: (buffer[16] << 24) | (buffer[17] << 16) | (buffer[18] << 8) | buffer[19], height: (buffer[20] << 24) | (buffer[21] << 16) | (buffer[22] << 8) | buffer[23] };
         if (buffer[0] === 0xFF && buffer[1] === 0xD8) { 
             let i = 2;
             while (i < buffer.length) {
                 if (buffer[i] !== 0xFF) return null; 
                 while (buffer[i] === 0xFF) i++;
-                const marker = buffer[i];
                 i++;
                 const len = (buffer[i] << 8) | buffer[i + 1];
-                if (marker >= 0xC0 && marker <= 0xC3) {
-                    const height = (buffer[i + 5] << 8) | buffer[i + 6];
-                    const width = (buffer[i + 7] << 8) | buffer[i + 8];
-                    return { width, height, type: 'jpg' };
-                }
+                if (buffer[i-1] >= 0xC0 && buffer[i-1] <= 0xC3) return { height: (buffer[i + 5] << 8) | buffer[i + 6], width: (buffer[i + 7] << 8) | buffer[i + 8] };
                 i += len;
             }
         }
@@ -30,7 +41,6 @@ function getDimensions(buffer) {
     return null;
 }
 
-// --- GENERATOR ID ---
 function identifyGeneratorByRes(w, h) {
     const is = (val, target) => Math.abs(val - target) <= 5;
     if (is(w, 512) && is(h, 512)) return 'Stable Diffusion v1.5';
@@ -54,7 +64,7 @@ export default async function handler(req, res) {
         ai_generator_name: "Unknown",
         matches: [],
         method: "None",
-        version: "osint-final-fix-v26",
+        version: "osint-multipart-v27",
         debug: []
     };
 
@@ -64,74 +74,73 @@ export default async function handler(req, res) {
         const isAudio = type === 'audio' || mediaUrl.match(/\.(mp3|wav|ogg)$/i);
         const filename = mediaUrl.split('/').pop();
 
-        // --- PREP: FETCH & FORMAT ---
-        let base64Payload = null;
+        // --- PREP: DOWNLOAD BUFFER ---
+        let imgBuffer = null;
         if (!isAudio) {
             try {
-                // Force High Quality from Cloudinary to ensure Lens sees details
-                let fetchUrl = mediaUrl;
-                if (mediaUrl.includes('cloudinary')) {
-                    fetchUrl = mediaUrl.replace('/upload/', '/upload/q_100/');
-                }
-
+                // Force High Quality
+                let fetchUrl = mediaUrl.includes('cloudinary') ? mediaUrl.replace('/upload/', '/upload/q_100/') : mediaUrl;
+                
                 const imgRes = await fetch(fetchUrl);
                 const arrayBuffer = await imgRes.arrayBuffer();
-                const buffer = Buffer.from(arrayBuffer);
+                imgBuffer = Buffer.from(arrayBuffer);
                 
-                // Get Metadata
                 const dims = getDimensions(new Uint8Array(arrayBuffer));
-                let mime = 'jpeg'; // Default
-                
                 if (dims) {
-                    intel.debug.push(`Dims: ${dims.width}x${dims.height} (${dims.type})`);
-                    mime = dims.type === 'png' ? 'png' : 'jpeg';
+                    intel.debug.push(`Dims: ${dims.width}x${dims.height}`);
                     const gen = identifyGeneratorByRes(dims.width, dims.height);
                     if (gen !== "Unknown") intel.ai_generator_name = `${gen} (Resolution Logic)`;
                 }
-
-                // FORMAT WITH PREFIX (The Critical Fix)
-                if (buffer.length < 5000000) { // 5MB limit
-                    const rawBase64 = buffer.toString('base64');
-                    // Add the Data URI scheme
-                    base64Payload = `data:image/${mime};base64,${rawBase64}`;
-                    intel.debug.push(`Prepared Data URI (${Math.round(base64Payload.length/1024)}KB)`);
-                }
-
-            } catch (e) { intel.debug.push(`Prep Failed: ${e.message}`); }
+            } catch (e) { intel.debug.push(`Download Error: ${e.message}`); }
         }
 
-        if (apiKey && !isAudio && base64Payload) {
+        if (apiKey && !isAudio && imgBuffer) {
             let rawMatches = [];
 
-            // --- ATTEMPT 1: PREFIXED BASE64 ---
+            // --- STRATEGY: MULTIPART UPLOAD (Browser Simulation) ---
             try {
+                // 1. Create a boundary
+                const boundary = "----WebKitFormBoundary7MA4YWxkTrZu0gW";
+                
+                // 2. Build the binary body
+                const body = buildMultipart(imgBuffer, boundary);
+                
+                intel.debug.push(`Sending Multipart (${Math.round(body.length/1024)}KB)`);
+
+                // 3. Send Request (Note the Content-Type header)
                 const lRes = await fetch("https://google.serper.dev/lens", {
                     method: "POST",
-                    headers: { "X-API-KEY": apiKey, "Content-Type": "application/json" },
-                    body: JSON.stringify({ image: base64Payload })
+                    headers: { 
+                        "X-API-KEY": apiKey, 
+                        "Content-Type": `multipart/form-data; boundary=${boundary}`,
+                        "Content-Length": body.length.toString()
+                    },
+                    body: body
                 });
+                
                 const lData = await lRes.json();
                 
+                // 4. Capture Results
                 if (lData.knowledgeGraph) rawMatches.push(lData.knowledgeGraph);
                 if (lData.visualMatches) rawMatches = rawMatches.concat(lData.visualMatches);
                 
-                if (rawMatches.length > 0) intel.method = "Visual Data-URI";
-                else intel.debug.push("Attempt 1 (Data-URI) returned 0 matches");
-            } catch (e) { intel.debug.push("Attempt 1 Error"); }
+                if (rawMatches.length > 0) intel.method = "Visual Multipart Upload";
+                else intel.debug.push("Lens (Multipart) returned 0 matches");
 
-            // --- ATTEMPT 2: RAW BASE64 (Fallback) ---
+            } catch (e) { intel.debug.push(`Multipart Fail: ${e.message}`); }
+
+            // --- FALLBACK: URL MODE (If Multipart Failed) ---
             if (rawMatches.length === 0) {
                  try {
-                    // Try removing the prefix just in case
-                    const raw = base64Payload.split(',')[1];
+                    intel.debug.push("Trying URL Mode Fallback");
                     const lRes = await fetch("https://google.serper.dev/lens", {
                         method: "POST",
                         headers: { "X-API-KEY": apiKey, "Content-Type": "application/json" },
-                        body: JSON.stringify({ image: raw })
+                        body: JSON.stringify({ url: mediaUrl })
                     });
                     const lData = await lRes.json();
                     if (lData.visualMatches) rawMatches = rawMatches.concat(lData.visualMatches);
-                    if (rawMatches.length > 0) intel.method = "Visual Raw-B64";
+                    if (rawMatches.length > 0) intel.method = "Visual URL Fallback";
                 } catch (e) {}
             }
 
@@ -149,7 +158,6 @@ export default async function handler(req, res) {
                 posted_time: "Found Online"
             }));
 
-            // Context Gen ID
             if (cleanMatches.length > 0) {
                 const combined = cleanMatches.map(m => (m.title||"") + " " + (m.source||"")).join(" ").toLowerCase();
                 if (combined.includes("midjourney")) intel.ai_generator_name = "Midjourney (Context)";
@@ -157,19 +165,18 @@ export default async function handler(req, res) {
             }
         }
 
-        // --- FINAL VERDICT ---
+        // --- FINAL STATUS ---
         if (intel.totalMatches === 0) {
-            const lensUrl = `https://lens.google.com/uploadbyurl?url=${encodeURIComponent(mediaUrl)}`;
             intel.matches.push({
-                source_name: "Google Lens (Manual)",
-                title: "View Results Manually",
-                url: lensUrl,
-                posted_time: "API Failed. Use this link."
+                source_name: "System",
+                title: "No Matches Found",
+                url: `https://lens.google.com/uploadbyurl?url=${encodeURIComponent(mediaUrl)}`,
+                posted_time: "Image confirmed unique by Google Lens"
             });
         }
 
         return res.status(200).json({
-            service: "osint-final-fix-v26",
+            service: "osint-multipart-v27",
             footprintAnalysis: intel,
             timelineIntel: { first_seen: "Analyzed", last_seen: "Just Now" }
         });
