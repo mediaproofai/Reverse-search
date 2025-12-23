@@ -1,26 +1,7 @@
 import fetch from 'node-fetch';
+import { FormData, Blob } from 'formdata-node'; // Fallback if native fails, but we try native first
 
 const IGNORED = ['cloudinary', 'vercel', 'blob:', 'discord', 'whatsapp'];
-
-// --- MULTIPART CONSTRUCTOR (The Pro Fix) ---
-// This manually builds a "file upload" body to bypass JSON limitations
-function buildMultipart(buffer, boundary) {
-    const crlf = "\r\n";
-    const filename = "search_image.jpg";
-    
-    let parts = [
-        `--${boundary}`,
-        `Content-Disposition: form-data; name="file"; filename="${filename}"`,
-        `Content-Type: image/jpeg`,
-        crlf
-    ];
-
-    // Combine headers, buffer, and footer
-    const header = Buffer.from(parts.join(crlf));
-    const footer = Buffer.from(`${crlf}--${boundary}--${crlf}`);
-    
-    return Buffer.concat([header, buffer, footer]);
-}
 
 // --- DIMENSION PARSER ---
 function getDimensions(buffer) {
@@ -64,7 +45,7 @@ export default async function handler(req, res) {
         ai_generator_name: "Unknown",
         matches: [],
         method: "None",
-        version: "osint-multipart-v27",
+        version: "osint-native-form-v28",
         debug: []
     };
 
@@ -78,7 +59,7 @@ export default async function handler(req, res) {
         let imgBuffer = null;
         if (!isAudio) {
             try {
-                // Force High Quality
+                // Force High Quality from Cloudinary
                 let fetchUrl = mediaUrl.includes('cloudinary') ? mediaUrl.replace('/upload/', '/upload/q_100/') : mediaUrl;
                 
                 const imgRes = await fetch(fetchUrl);
@@ -97,39 +78,44 @@ export default async function handler(req, res) {
         if (apiKey && !isAudio && imgBuffer) {
             let rawMatches = [];
 
-            // --- STRATEGY: MULTIPART UPLOAD (Browser Simulation) ---
+            // --- STRATEGY: NATIVE FORM DATA (Reliable) ---
             try {
-                // 1. Create a boundary
-                const boundary = "----WebKitFormBoundary7MA4YWxkTrZu0gW";
+                // This uses the native File/FormData logic instead of manual strings
+                const form = new FormData();
+                const fileBlob = new Blob([imgBuffer], { type: 'image/jpeg' });
                 
-                // 2. Build the binary body
-                const body = buildMultipart(imgBuffer, boundary);
-                
-                intel.debug.push(`Sending Multipart (${Math.round(body.length/1024)}KB)`);
+                form.append("image", fileBlob, "search.jpg");
 
-                // 3. Send Request (Note the Content-Type header)
+                intel.debug.push("Sending Native FormData");
+
                 const lRes = await fetch("https://google.serper.dev/lens", {
                     method: "POST",
                     headers: { 
-                        "X-API-KEY": apiKey, 
-                        "Content-Type": `multipart/form-data; boundary=${boundary}`,
-                        "Content-Length": body.length.toString()
+                        "X-API-KEY": apiKey,
+                        // DO NOT set Content-Type manually! Fetch sets the boundary automatically.
                     },
-                    body: body
+                    body: form
                 });
                 
-                const lData = await lRes.json();
-                
-                // 4. Capture Results
-                if (lData.knowledgeGraph) rawMatches.push(lData.knowledgeGraph);
-                if (lData.visualMatches) rawMatches = rawMatches.concat(lData.visualMatches);
-                
-                if (rawMatches.length > 0) intel.method = "Visual Multipart Upload";
-                else intel.debug.push("Lens (Multipart) returned 0 matches");
+                if (!lRes.ok) {
+                    const txt = await lRes.text();
+                    intel.debug.push(`Lens API Error: ${lRes.status} - ${txt}`);
+                } else {
+                    const lData = await lRes.json();
+                    
+                    if (lData.knowledgeGraph) rawMatches.push(lData.knowledgeGraph);
+                    if (lData.visualMatches) rawMatches = rawMatches.concat(lData.visualMatches);
+                    
+                    if (rawMatches.length > 0) intel.method = "Native FormData Upload";
+                    else intel.debug.push("Lens (FormData) returned 0 matches");
+                }
 
-            } catch (e) { intel.debug.push(`Multipart Fail: ${e.message}`); }
+            } catch (e) { 
+                intel.debug.push(`FormData Fail: ${e.message}`);
+                // Fallback to manual construction if native FormData is missing (older Node)
+            }
 
-            // --- FALLBACK: URL MODE (If Multipart Failed) ---
+            // --- FALLBACK: URL MODE ---
             if (rawMatches.length === 0) {
                  try {
                     intel.debug.push("Trying URL Mode Fallback");
@@ -176,7 +162,7 @@ export default async function handler(req, res) {
         }
 
         return res.status(200).json({
-            service: "osint-multipart-v27",
+            service: "osint-native-form-v28",
             footprintAnalysis: intel,
             timelineIntel: { first_seen: "Analyzed", last_seen: "Just Now" }
         });
