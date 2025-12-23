@@ -1,9 +1,29 @@
 import fetch from 'node-fetch';
-import { FormData, Blob } from 'formdata-node'; // Fallback if native fails, but we try native first
 
 const IGNORED = ['cloudinary', 'vercel', 'blob:', 'discord', 'whatsapp'];
 
-// --- DIMENSION PARSER ---
+// --- LIGHTWEIGHT MULTIPART CONSTRUCTOR (No Libraries) ---
+// This builds a standard HTTP file upload manually to save processing time.
+function buildMultipart(buffer, boundary) {
+    const CRLF = "\r\n";
+    const filename = "image.jpg";
+    
+    // Strict HTTP Multipart format
+    const header = [
+        `--${boundary}`,
+        `Content-Disposition: form-data; name="file"; filename="${filename}"`,
+        `Content-Type: image/jpeg`,
+        CRLF
+    ].join(CRLF); // Ensure strict CRLF
+
+    // Combine: Header + Binary Image + Footer
+    const headerBuf = Buffer.from(header);
+    const footerBuf = Buffer.from(`${CRLF}--${boundary}--${CRLF}`);
+    
+    return Buffer.concat([headerBuf, buffer, footerBuf]);
+}
+
+// --- DIMENSION PARSER (Fast) ---
 function getDimensions(buffer) {
     try {
         if (buffer[0] === 0x89 && buffer[1] === 0x50) return { width: (buffer[16] << 24) | (buffer[17] << 16) | (buffer[18] << 8) | buffer[19], height: (buffer[20] << 24) | (buffer[21] << 16) | (buffer[22] << 8) | buffer[23] };
@@ -45,7 +65,7 @@ export default async function handler(req, res) {
         ai_generator_name: "Unknown",
         matches: [],
         method: "None",
-        version: "osint-native-form-v28",
+        version: "osint-speed-v29",
         debug: []
     };
 
@@ -55,17 +75,18 @@ export default async function handler(req, res) {
         const isAudio = type === 'audio' || mediaUrl.match(/\.(mp3|wav|ogg)$/i);
         const filename = mediaUrl.split('/').pop();
 
-        // --- PREP: DOWNLOAD BUFFER ---
+        // --- STEP 1: DOWNLOAD & PREP (Fast Mode) ---
         let imgBuffer = null;
         if (!isAudio) {
             try {
-                // Force High Quality from Cloudinary
-                let fetchUrl = mediaUrl.includes('cloudinary') ? mediaUrl.replace('/upload/', '/upload/q_100/') : mediaUrl;
+                // Use a smaller version for speed (1000px is plenty for Lens)
+                const fetchUrl = mediaUrl.includes('cloudinary') ? mediaUrl.replace('/upload/', '/upload/w_1000,q_auto/') : mediaUrl;
                 
                 const imgRes = await fetch(fetchUrl);
                 const arrayBuffer = await imgRes.arrayBuffer();
                 imgBuffer = Buffer.from(arrayBuffer);
                 
+                // Parse Dims
                 const dims = getDimensions(new Uint8Array(arrayBuffer));
                 if (dims) {
                     intel.debug.push(`Dims: ${dims.width}x${dims.height}`);
@@ -75,60 +96,38 @@ export default async function handler(req, res) {
             } catch (e) { intel.debug.push(`Download Error: ${e.message}`); }
         }
 
+        // --- STEP 2: MULTIPART UPLOAD (Manual) ---
         if (apiKey && !isAudio && imgBuffer) {
             let rawMatches = [];
 
-            // --- STRATEGY: NATIVE FORM DATA (Reliable) ---
             try {
-                // This uses the native File/FormData logic instead of manual strings
-                const form = new FormData();
-                const fileBlob = new Blob([imgBuffer], { type: 'image/jpeg' });
+                const boundary = "----WebKitFormBoundarySpeedTest";
+                const body = buildMultipart(imgBuffer, boundary);
                 
-                form.append("image", fileBlob, "search.jpg");
-
-                intel.debug.push("Sending Native FormData");
+                intel.debug.push(`Sending ${Math.round(body.length/1024)}KB via Multipart`);
 
                 const lRes = await fetch("https://google.serper.dev/lens", {
                     method: "POST",
                     headers: { 
-                        "X-API-KEY": apiKey,
-                        // DO NOT set Content-Type manually! Fetch sets the boundary automatically.
+                        "X-API-KEY": apiKey, 
+                        "Content-Type": `multipart/form-data; boundary=${boundary}`,
+                        "Content-Length": body.length.toString()
                     },
-                    body: form
+                    body: body
                 });
                 
                 if (!lRes.ok) {
                     const txt = await lRes.text();
-                    intel.debug.push(`Lens API Error: ${lRes.status} - ${txt}`);
+                    intel.debug.push(`API Error: ${lRes.status} - ${txt}`);
                 } else {
                     const lData = await lRes.json();
-                    
                     if (lData.knowledgeGraph) rawMatches.push(lData.knowledgeGraph);
                     if (lData.visualMatches) rawMatches = rawMatches.concat(lData.visualMatches);
                     
-                    if (rawMatches.length > 0) intel.method = "Native FormData Upload";
-                    else intel.debug.push("Lens (FormData) returned 0 matches");
+                    if (rawMatches.length > 0) intel.method = "Visual Multipart (Fast)";
+                    else intel.debug.push("Lens (Multipart) returned 0 matches");
                 }
-
-            } catch (e) { 
-                intel.debug.push(`FormData Fail: ${e.message}`);
-                // Fallback to manual construction if native FormData is missing (older Node)
-            }
-
-            // --- FALLBACK: URL MODE ---
-            if (rawMatches.length === 0) {
-                 try {
-                    intel.debug.push("Trying URL Mode Fallback");
-                    const lRes = await fetch("https://google.serper.dev/lens", {
-                        method: "POST",
-                        headers: { "X-API-KEY": apiKey, "Content-Type": "application/json" },
-                        body: JSON.stringify({ url: mediaUrl })
-                    });
-                    const lData = await lRes.json();
-                    if (lData.visualMatches) rawMatches = rawMatches.concat(lData.visualMatches);
-                    if (rawMatches.length > 0) intel.method = "Visual URL Fallback";
-                } catch (e) {}
-            }
+            } catch (e) { intel.debug.push(`Upload Error: ${e.message}`); }
 
             // --- PROCESSING ---
             const cleanMatches = rawMatches.filter(m => 
@@ -151,18 +150,18 @@ export default async function handler(req, res) {
             }
         }
 
-        // --- FINAL STATUS ---
+        // --- FALLBACK: MANUAL LINK (Always Valid) ---
         if (intel.totalMatches === 0) {
             intel.matches.push({
-                source_name: "System",
-                title: "No Matches Found",
+                source_name: "Google Lens (Manual)",
+                title: "Click to Verify (API Timed Out or Blocked)",
                 url: `https://lens.google.com/uploadbyurl?url=${encodeURIComponent(mediaUrl)}`,
-                posted_time: "Image confirmed unique by Google Lens"
+                posted_time: "Manual Check Required"
             });
         }
 
         return res.status(200).json({
-            service: "osint-native-form-v28",
+            service: "osint-speed-v29",
             footprintAnalysis: intel,
             timelineIntel: { first_seen: "Analyzed", last_seen: "Just Now" }
         });
