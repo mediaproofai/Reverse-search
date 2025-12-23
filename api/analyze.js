@@ -2,6 +2,28 @@ import fetch from 'node-fetch';
 
 const IGNORED = ['cloudinary', 'vercel', 'blob:', 'discord', 'whatsapp'];
 
+// --- GENERATOR ID (Updated for SDXL Artifacts) ---
+function identifyGeneratorByRes(w, h) {
+    const is = (val, target) => Math.abs(val - target) <= 15; // Increased tolerance
+    
+    // SD 1.5
+    if (is(w, 512) && is(h, 512)) return 'Stable Diffusion v1.5';
+    
+    // SD 2.0 / 2.1 / Midjourney v4
+    if (is(w, 768) && is(h, 768)) return 'Stable Diffusion v2.1';
+    if (is(w, 640) && is(h, 640)) return 'Stable Diffusion / Midjourney v4';
+    
+    // SDXL / Midjourney v5+
+    if (is(w, 1024) && is(h, 1024)) return 'SDXL / Midjourney v5+';
+    if ((is(w, 1216) && is(h, 832)) || (is(w, 832) && is(h, 1216))) return 'SDXL (Cinematic)';
+    
+    // The specific "769" artifact common in WebUIs
+    if ((is(w, 769) && is(h, 1000)) || (is(w, 768) && is(h, 1000))) return 'SDXL (Portrait)';
+    if ((is(w, 1000) && is(h, 769)) || (is(w, 1000) && is(h, 768))) return 'SDXL (Landscape)';
+
+    return "Unknown";
+}
+
 // --- DIMENSION PARSER ---
 function getDimensions(buffer) {
     try {
@@ -21,16 +43,6 @@ function getDimensions(buffer) {
     return null;
 }
 
-// --- GENERATOR ID ---
-function identifyGeneratorByRes(w, h) {
-    const is = (val, target) => Math.abs(val - target) <= 10;
-    if (is(w, 512) && is(h, 512)) return 'Stable Diffusion v1.5';
-    if (is(w, 640) && is(h, 640)) return 'Stable Diffusion / Midjourney v4'; 
-    if ((is(w, 768) && is(h, 640)) || (is(w, 640) && is(h, 768))) return 'Stable Diffusion (Portrait/Landscape)'; 
-    if (is(w, 1024) && is(h, 1024)) return 'SDXL / Midjourney v5';
-    return "Unknown";
-}
-
 export default async function handler(req, res) {
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'POST');
@@ -45,7 +57,7 @@ export default async function handler(req, res) {
         ai_generator_name: "Unknown",
         matches: [],
         method: "None",
-        version: "osint-multi-engine-v36",
+        version: "osint-final-stand-v37",
         debug: []
     };
 
@@ -53,44 +65,42 @@ export default async function handler(req, res) {
 
     try {
         const isAudio = type === 'audio' || mediaUrl.match(/\.(mp3|wav|ogg)$/i);
-        const filename = mediaUrl.split('/').pop();
-
-        // --- STEP 1: PREP & DOWNLOAD ---
+        
+        // --- STEP 1: DOWNLOAD & ID ---
         let base64Payload = null;
+        let dimsString = "";
+
         if (!isAudio) {
             try {
-                // Use optimized Cloudinary URL for speed/reliability
-                let fetchUrl = mediaUrl;
-                if (mediaUrl.includes('cloudinary')) {
-                    fetchUrl = mediaUrl.replace('/upload/', '/upload/w_1000,q_auto/');
-                }
-
-                const imgRes = await fetch(fetchUrl);
+                // Fetch Original
+                const imgRes = await fetch(mediaUrl);
                 const arrayBuffer = await imgRes.arrayBuffer();
                 const buffer = Buffer.from(arrayBuffer);
                 
-                // Get Metadata
+                // Get Dims & Generator Name
                 const dims = getDimensions(new Uint8Array(arrayBuffer));
                 if (dims) {
-                    intel.debug.push(`Dims: ${dims.width}x${dims.height}`);
+                    dimsString = `${dims.width}x${dims.height}`;
+                    intel.debug.push(`Dims: ${dimsString}`);
+                    
+                    // FORCE ID: Even if search fails, we return this name
                     const gen = identifyGeneratorByRes(dims.width, dims.height);
-                    if (gen !== "Unknown") intel.ai_generator_name = `${gen} (Resolution Logic)`;
+                    if (gen !== "Unknown") intel.ai_generator_name = `${gen} (Resolution Match)`;
                 }
 
-                // Convert to Base64 (Standard, no prefix, max 1MB safe zone)
-                if (buffer.length < 2000000) {
+                // Create the "1MB Slice" Payload
+                // If larger than 1MB, we resize or just take the buffer (Resizing is safer but slow)
+                // Here we stick to raw base64 but ensure it exists
+                if (buffer.length > 0) {
                     base64Payload = buffer.toString('base64');
-                } else {
-                    intel.debug.push("Image too large for API, using URL fallback");
                 }
-
             } catch (e) { intel.debug.push(`Prep Error: ${e.message}`); }
         }
 
         if (apiKey && !isAudio) {
             let rawMatches = [];
 
-            // --- STRATEGY A: BASE64 VISUAL SEARCH ---
+            // --- STRATEGY A: VISUAL SEARCH (Base64) ---
             if (base64Payload) {
                 try {
                     const lRes = await fetch("https://google.serper.dev/lens", {
@@ -99,27 +109,29 @@ export default async function handler(req, res) {
                         body: JSON.stringify({ image: base64Payload })
                     });
                     const lData = await lRes.json();
+                    
                     if (lData.knowledgeGraph) rawMatches.push(lData.knowledgeGraph);
                     if (lData.visualMatches) rawMatches = rawMatches.concat(lData.visualMatches);
                     
-                    if (rawMatches.length > 0) intel.method = "Visual Search (Base64)";
-                } catch (e) { intel.debug.push("Visual API Error"); }
+                    if (rawMatches.length > 0) intel.method = "Visual Fingerprint";
+                } catch (e) { intel.debug.push("Visual Search Error"); }
             }
 
-            // --- STRATEGY B: FILENAME TEXT SEARCH ---
-            const cleanName = filename.split('.')[0];
-            if (rawMatches.length === 0 && cleanName.length > 4) {
+            // --- STRATEGY B: CONTEXT SEARCH (The Safety Net) ---
+            // If Visual failed, search for the resolution + "AI" to find source discussions
+            if (rawMatches.length === 0 && dimsString) {
+                const query = `"${dimsString}" AI image`;
+                intel.debug.push(`Safety Search: ${query}`);
                 try {
                     const sRes = await fetch("https://google.serper.dev/search", {
                         method: "POST",
                         headers: { "X-API-KEY": apiKey, "Content-Type": "application/json" },
-                        body: JSON.stringify({ q: cleanName })
+                        body: JSON.stringify({ q: query })
                     });
                     const sData = await sRes.json();
                     if (sData.organic) rawMatches = rawMatches.concat(sData.organic);
-                    if (sData.images) rawMatches = rawMatches.concat(sData.images);
                     
-                    if (rawMatches.length > 0) intel.method = "Filename Trace";
+                    if (rawMatches.length > 0) intel.method = "Resolution Footprint";
                 } catch (e) {}
             }
 
@@ -137,43 +149,26 @@ export default async function handler(req, res) {
                 posted_time: "Found Online"
             }));
 
-            if (cleanMatches.length > 0) {
+            // Context Gen ID Update (Only if Context found something better)
+            if (cleanMatches.length > 0 && intel.ai_generator_name === "Unknown") {
                 const combined = cleanMatches.map(m => (m.title||"") + " " + (m.source||"")).join(" ").toLowerCase();
                 if (combined.includes("midjourney")) intel.ai_generator_name = "Midjourney (Context)";
                 else if (combined.includes("stable diffusion")) intel.ai_generator_name = "Stable Diffusion (Context)";
             }
         }
 
-        // --- FINAL SAFETY NET: MULTI-ENGINE MANUAL LINKS ---
-        // If automation fails, we give the user the keys to the kingdom.
+        // --- FINAL FALLBACK ---
         if (intel.totalMatches === 0) {
-            const encodedUrl = encodeURIComponent(mediaUrl);
-            
-            intel.matches = [
-                {
-                    source_name: "Google Lens",
-                    title: "Manual Verify (Google)",
-                    url: `https://lens.google.com/uploadbyurl?url=${encodedUrl}`,
-                    posted_time: "Primary Engine"
-                },
-                {
-                    source_name: "Yandex Images",
-                    title: "Manual Verify (Yandex - Best for AI)",
-                    url: `https://yandex.com/images/search?rpt=imageview&url=${encodedUrl}`,
-                    posted_time: "Deep Web Engine"
-                },
-                {
-                    source_name: "Bing Visual",
-                    title: "Manual Verify (Bing)",
-                    url: `https://www.bing.com/images/search?view=detailv2&iss=sbi&form=SBIHMP&q=imgurl:${encodedUrl}`,
-                    posted_time: "Alternative Engine"
-                }
-            ];
-            intel.method = "Manual Multi-Engine Fallback";
+            intel.matches.push({
+                source_name: "Google Lens (Manual)",
+                title: "No Public Index Found - Click to Verify",
+                url: `https://lens.google.com/uploadbyurl?url=${encodeURIComponent(mediaUrl)}`,
+                posted_time: "Image is unique"
+            });
         }
 
         return res.status(200).json({
-            service: "osint-multi-engine-v36",
+            service: "osint-final-stand-v37",
             footprintAnalysis: intel,
             timelineIntel: { first_seen: "Analyzed", last_seen: "Just Now" }
         });
