@@ -8,7 +8,7 @@ function getDimensions(buffer) {
         if (buffer[0] === 0x89 && buffer[1] === 0x50) { 
             const width = (buffer[16] << 24) | (buffer[17] << 16) | (buffer[18] << 8) | buffer[19];
             const height = (buffer[20] << 24) | (buffer[21] << 16) | (buffer[22] << 8) | buffer[23];
-            return { width, height };
+            return { width, height, type: 'png' };
         }
         if (buffer[0] === 0xFF && buffer[1] === 0xD8) { 
             let i = 2;
@@ -21,7 +21,7 @@ function getDimensions(buffer) {
                 if (marker >= 0xC0 && marker <= 0xC3) {
                     const height = (buffer[i + 5] << 8) | buffer[i + 6];
                     const width = (buffer[i + 7] << 8) | buffer[i + 8];
-                    return { width, height };
+                    return { width, height, type: 'jpg' };
                 }
                 i += len;
             }
@@ -54,7 +54,7 @@ export default async function handler(req, res) {
         ai_generator_name: "Unknown",
         matches: [],
         method: "None",
-        version: "osint-triple-threat-v25",
+        version: "osint-final-fix-v26",
         debug: []
     };
 
@@ -64,82 +64,75 @@ export default async function handler(req, res) {
         const isAudio = type === 'audio' || mediaUrl.match(/\.(mp3|wav|ogg)$/i);
         const filename = mediaUrl.split('/').pop();
 
-        // --- PREP: FETCH ORIGINAL ---
+        // --- PREP: FETCH & FORMAT ---
         let base64Payload = null;
         if (!isAudio) {
             try {
-                const imgRes = await fetch(mediaUrl);
+                // Force High Quality from Cloudinary to ensure Lens sees details
+                let fetchUrl = mediaUrl;
+                if (mediaUrl.includes('cloudinary')) {
+                    fetchUrl = mediaUrl.replace('/upload/', '/upload/q_100/');
+                }
+
+                const imgRes = await fetch(fetchUrl);
                 const arrayBuffer = await imgRes.arrayBuffer();
                 const buffer = Buffer.from(arrayBuffer);
                 
-                // Get Dims
+                // Get Metadata
                 const dims = getDimensions(new Uint8Array(arrayBuffer));
+                let mime = 'jpeg'; // Default
+                
                 if (dims) {
-                    intel.debug.push(`Dims: ${dims.width}x${dims.height}`);
+                    intel.debug.push(`Dims: ${dims.width}x${dims.height} (${dims.type})`);
+                    mime = dims.type === 'png' ? 'png' : 'jpeg';
                     const gen = identifyGeneratorByRes(dims.width, dims.height);
                     if (gen !== "Unknown") intel.ai_generator_name = `${gen} (Resolution Logic)`;
                 }
 
-                // Create Base64 (Limit to 4MB)
-                if (buffer.length < 4000000) {
-                    base64Payload = buffer.toString('base64');
+                // FORMAT WITH PREFIX (The Critical Fix)
+                if (buffer.length < 5000000) { // 5MB limit
+                    const rawBase64 = buffer.toString('base64');
+                    // Add the Data URI scheme
+                    base64Payload = `data:image/${mime};base64,${rawBase64}`;
+                    intel.debug.push(`Prepared Data URI (${Math.round(base64Payload.length/1024)}KB)`);
                 }
+
             } catch (e) { intel.debug.push(`Prep Failed: ${e.message}`); }
         }
 
-        if (apiKey && !isAudio) {
+        if (apiKey && !isAudio && base64Payload) {
             let rawMatches = [];
 
-            // --- ATTEMPT 1: PIXEL SEARCH (Primary) ---
-            if (base64Payload) {
-                try {
+            // --- ATTEMPT 1: PREFIXED BASE64 ---
+            try {
+                const lRes = await fetch("https://google.serper.dev/lens", {
+                    method: "POST",
+                    headers: { "X-API-KEY": apiKey, "Content-Type": "application/json" },
+                    body: JSON.stringify({ image: base64Payload })
+                });
+                const lData = await lRes.json();
+                
+                if (lData.knowledgeGraph) rawMatches.push(lData.knowledgeGraph);
+                if (lData.visualMatches) rawMatches = rawMatches.concat(lData.visualMatches);
+                
+                if (rawMatches.length > 0) intel.method = "Visual Data-URI";
+                else intel.debug.push("Attempt 1 (Data-URI) returned 0 matches");
+            } catch (e) { intel.debug.push("Attempt 1 Error"); }
+
+            // --- ATTEMPT 2: RAW BASE64 (Fallback) ---
+            if (rawMatches.length === 0) {
+                 try {
+                    // Try removing the prefix just in case
+                    const raw = base64Payload.split(',')[1];
                     const lRes = await fetch("https://google.serper.dev/lens", {
                         method: "POST",
                         headers: { "X-API-KEY": apiKey, "Content-Type": "application/json" },
-                        body: JSON.stringify({ image: base64Payload })
+                        body: JSON.stringify({ image: raw })
                     });
                     const lData = await lRes.json();
-                    if (lData.knowledgeGraph) rawMatches.push(lData.knowledgeGraph);
                     if (lData.visualMatches) rawMatches = rawMatches.concat(lData.visualMatches);
-                    
-                    if (rawMatches.length > 0) intel.method = "Visual Pixels";
-                    else intel.debug.push("Attempt 1 (Pixels): 0 matches");
-                } catch (e) { intel.debug.push("Attempt 1 Error"); }
-            }
-
-            // --- ATTEMPT 2: URL SEARCH (Fallback) ---
-            if (rawMatches.length === 0) {
-                try {
-                    const lRes = await fetch("https://google.serper.dev/lens", {
-                        method: "POST",
-                        headers: { "X-API-KEY": apiKey, "Content-Type": "application/json" },
-                        body: JSON.stringify({ url: mediaUrl })
-                    });
-                    const lData = await lRes.json();
-                    if (lData.knowledgeGraph) rawMatches.push(lData.knowledgeGraph);
-                    if (lData.visualMatches) rawMatches = rawMatches.concat(lData.visualMatches);
-
-                    if (rawMatches.length > 0) intel.method = "Visual URL";
-                    else intel.debug.push("Attempt 2 (URL): 0 matches");
-                } catch (e) { intel.debug.push("Attempt 2 Error"); }
-            }
-
-            // --- ATTEMPT 3: TEXT SEARCH (Last Resort) ---
-            if (rawMatches.length === 0) {
-                const cleanName = filename.split('.')[0];
-                intel.debug.push(`Attempt 3 (Text): "${cleanName}"`);
-                try {
-                    const sRes = await fetch("https://google.serper.dev/search", {
-                        method: "POST",
-                        headers: { "X-API-KEY": apiKey, "Content-Type": "application/json" },
-                        body: JSON.stringify({ q: cleanName })
-                    });
-                    const sData = await sRes.json();
-                    if (sData.organic) rawMatches = rawMatches.concat(sData.organic);
-                    if (sData.images) rawMatches = rawMatches.concat(sData.images);
-
-                    if (rawMatches.length > 0) intel.method = "Filename Trace";
-                } catch (e) { intel.debug.push("Attempt 3 Error"); }
+                    if (rawMatches.length > 0) intel.method = "Visual Raw-B64";
+                } catch (e) {}
             }
 
             // --- PROCESSING ---
@@ -164,19 +157,19 @@ export default async function handler(req, res) {
             }
         }
 
-        // --- FINAL FALLBACK ---
+        // --- FINAL VERDICT ---
         if (intel.totalMatches === 0) {
             const lensUrl = `https://lens.google.com/uploadbyurl?url=${encodeURIComponent(mediaUrl)}`;
             intel.matches.push({
                 source_name: "Google Lens (Manual)",
                 title: "View Results Manually",
                 url: lensUrl,
-                posted_time: "All 3 API methods failed. Click to verify."
+                posted_time: "API Failed. Use this link."
             });
         }
 
         return res.status(200).json({
-            service: "osint-triple-threat-v25",
+            service: "osint-final-fix-v26",
             footprintAnalysis: intel,
             timelineIntel: { first_seen: "Analyzed", last_seen: "Just Now" }
         });
