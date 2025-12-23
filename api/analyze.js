@@ -2,20 +2,13 @@ import fetch from 'node-fetch';
 
 const IGNORED = ['cloudinary', 'vercel', 'blob:', 'discord', 'whatsapp'];
 
-// --- GENERATOR ID (Enhanced Tolerance) ---
+// --- GENERATOR ID (Standard) ---
 function identifyGeneratorByRes(w, h) {
-    // Widen tolerance to 10px to catch cropping/rounding (e.g., 769px)
-    const is = (val, target) => Math.abs(val - target) <= 10;
-    
+    const is = (val, target) => Math.abs(val - target) <= 5;
     if (is(w, 512) && is(h, 512)) return 'Stable Diffusion v1.5';
     if (is(w, 640) && is(h, 640)) return 'Stable Diffusion / Midjourney v4'; 
     if ((is(w, 768) && is(h, 640)) || (is(w, 640) && is(h, 768))) return 'Stable Diffusion (Portrait/Landscape)'; 
-    if ((is(w, 768) && is(h, 512)) || (is(w, 512) && is(h, 768))) return 'Stable Diffusion (Landscape/Portrait)';
-    
-    // SDXL often uses 1024x1024 or near variations
     if (is(w, 1024) && is(h, 1024)) return 'SDXL / Midjourney v5';
-    if ((is(w, 1216) && is(h, 832)) || (is(w, 832) && is(h, 1216))) return 'SDXL (Cinematic)';
-    
     return "Unknown";
 }
 
@@ -52,7 +45,7 @@ export default async function handler(req, res) {
         ai_generator_name: "Unknown",
         matches: [],
         method: "None",
-        version: "osint-titan-v32",
+        version: "osint-origin-v33",
         debug: []
     };
 
@@ -60,21 +53,13 @@ export default async function handler(req, res) {
 
     try {
         const isAudio = type === 'audio' || mediaUrl.match(/\.(mp3|wav|ogg)$/i);
+        const filename = mediaUrl.split('/').pop();
 
-        // --- STEP 1: PREP ---
-        let searchUrl = mediaUrl;
-        
+        // --- STEP 1: METADATA (Internal Only) ---
         if (!isAudio) {
             try {
-                // 1. Optimize Cloudinary URL for Google Bot
-                // We use 'w_1000' (good quality) and 'q_auto' (optimized compression)
-                if (mediaUrl.includes('cloudinary')) {
-                    searchUrl = mediaUrl.replace('/upload/', '/upload/w_1000,q_auto/');
-                    intel.debug.push("Optimized Cloudinary URL");
-                }
-
-                // 2. Fetch for Dims (Internal Use Only)
-                const imgRes = await fetch(searchUrl);
+                // Fetch just to get dimensions for the generator ID
+                const imgRes = await fetch(mediaUrl);
                 const arrayBuffer = await imgRes.arrayBuffer();
                 const dims = getDimensions(new Uint8Array(arrayBuffer));
                 
@@ -83,31 +68,46 @@ export default async function handler(req, res) {
                     const gen = identifyGeneratorByRes(dims.width, dims.height);
                     if (gen !== "Unknown") intel.ai_generator_name = `${gen} (Resolution Logic)`;
                 }
-
-            } catch (e) { intel.debug.push(`Prep Warning: ${e.message}`); }
+            } catch (e) { intel.debug.push("Dim Check Failed"); }
         }
 
-        // --- STEP 2: STRICT VISUAL SEARCH ---
-        // We ONLY search the image. No text fallback. This prevents "random" results.
         if (apiKey && !isAudio) {
             let rawMatches = [];
 
+            // --- STRATEGY A: RAW URL VISUAL SEARCH ---
+            // Sending the EXACT original link. No resizing. No quality changes.
             try {
+                intel.debug.push(`Scanning Original URL`);
                 const lRes = await fetch("https://google.serper.dev/lens", {
                     method: "POST",
                     headers: { "X-API-KEY": apiKey, "Content-Type": "application/json" },
-                    body: JSON.stringify({ url: searchUrl }) // Send the optimized URL
+                    body: JSON.stringify({ url: mediaUrl }) 
                 });
                 
                 const lData = await lRes.json();
-                
                 if (lData.knowledgeGraph) rawMatches.push(lData.knowledgeGraph);
                 if (lData.visualMatches) rawMatches = rawMatches.concat(lData.visualMatches);
                 
-                if (rawMatches.length > 0) intel.method = "Visual Fingerprint (Strict)";
-                else intel.debug.push("Visual Search found 0 matches");
+                if (rawMatches.length > 0) intel.method = "Visual Search (Original)";
+                else intel.debug.push("Visual Search: 0 Matches");
+            } catch (e) { intel.debug.push("Visual API Error"); }
 
-            } catch (e) { intel.debug.push("Lens API Error"); }
+            // --- STRATEGY B: FILENAME TEXT SEARCH ---
+            // Unfiltered. If the name is "brmol65...", we search it.
+            const cleanName = filename.split('.')[0];
+            try {
+                intel.debug.push(`Searching Text: "${cleanName}"`);
+                const sRes = await fetch("https://google.serper.dev/search", {
+                    method: "POST",
+                    headers: { "X-API-KEY": apiKey, "Content-Type": "application/json" },
+                    body: JSON.stringify({ q: cleanName })
+                });
+                const sData = await sRes.json();
+                if (sData.organic) rawMatches = rawMatches.concat(sData.organic);
+                if (sData.images) rawMatches = rawMatches.concat(sData.images);
+
+                if (rawMatches.length > 0 && intel.method === "None") intel.method = "Filename Trace";
+            } catch (e) { intel.debug.push("Text API Error"); }
 
             // --- PROCESSING ---
             const cleanMatches = rawMatches.filter(m => 
@@ -123,6 +123,7 @@ export default async function handler(req, res) {
                 posted_time: "Found Online"
             }));
 
+            // Context Gen ID
             if (cleanMatches.length > 0) {
                 const combined = cleanMatches.map(m => (m.title||"") + " " + (m.source||"")).join(" ").toLowerCase();
                 if (combined.includes("midjourney")) intel.ai_generator_name = "Midjourney (Context)";
@@ -133,15 +134,15 @@ export default async function handler(req, res) {
         // --- FINAL STATUS ---
         if (intel.totalMatches === 0) {
             intel.matches.push({
-                source_name: "System",
-                title: "No Visual Matches Found",
+                source_name: "Google Lens (Manual)",
+                title: "No Matches - Click to Verify",
                 url: `https://lens.google.com/uploadbyurl?url=${encodeURIComponent(mediaUrl)}`,
-                posted_time: "Image appears to be unique/synthetic"
+                posted_time: "Image is unique or API blocked"
             });
         }
 
         return res.status(200).json({
-            service: "osint-titan-v32",
+            service: "osint-origin-v33",
             footprintAnalysis: intel,
             timelineIntel: { first_seen: "Analyzed", last_seen: "Just Now" }
         });
