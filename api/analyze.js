@@ -2,9 +2,9 @@ import fetch from 'node-fetch';
 
 const IGNORED = ['cloudinary', 'vercel', 'blob:', 'discord', 'whatsapp'];
 
-// --- GENERATOR ID (Updated for SDXL Artifacts) ---
+// --- GENERATOR ID (Strict) ---
 function identifyGeneratorByRes(w, h) {
-    const is = (val, target) => Math.abs(val - target) <= 15; // Increased tolerance
+    const is = (val, target) => Math.abs(val - target) <= 15;
     
     // SD 1.5
     if (is(w, 512) && is(h, 512)) return 'Stable Diffusion v1.5';
@@ -17,7 +17,7 @@ function identifyGeneratorByRes(w, h) {
     if (is(w, 1024) && is(h, 1024)) return 'SDXL / Midjourney v5+';
     if ((is(w, 1216) && is(h, 832)) || (is(w, 832) && is(h, 1216))) return 'SDXL (Cinematic)';
     
-    // The specific "769" artifact common in WebUIs
+    // The specific "769" artifact
     if ((is(w, 769) && is(h, 1000)) || (is(w, 768) && is(h, 1000))) return 'SDXL (Portrait)';
     if ((is(w, 1000) && is(h, 769)) || (is(w, 1000) && is(h, 768))) return 'SDXL (Landscape)';
 
@@ -57,7 +57,7 @@ export default async function handler(req, res) {
         ai_generator_name: "Unknown",
         matches: [],
         method: "None",
-        version: "osint-final-stand-v37",
+        version: "osint-purist-v38",
         debug: []
     };
 
@@ -66,74 +66,55 @@ export default async function handler(req, res) {
     try {
         const isAudio = type === 'audio' || mediaUrl.match(/\.(mp3|wav|ogg)$/i);
         
-        // --- STEP 1: DOWNLOAD & ID ---
+        // --- STEP 1: DOWNLOAD & STANDARDIZE ---
         let base64Payload = null;
-        let dimsString = "";
 
         if (!isAudio) {
             try {
-                // Fetch Original
-                const imgRes = await fetch(mediaUrl);
-                const arrayBuffer = await imgRes.arrayBuffer();
-                const buffer = Buffer.from(arrayBuffer);
+                // 1. Fetch ORIGINAL for generator ID (dimensions matter)
+                const originalRes = await fetch(mediaUrl);
+                const originalBuffer = await originalRes.arrayBuffer();
+                const dims = getDimensions(new Uint8Array(originalBuffer));
                 
-                // Get Dims & Generator Name
-                const dims = getDimensions(new Uint8Array(arrayBuffer));
                 if (dims) {
-                    dimsString = `${dims.width}x${dims.height}`;
-                    intel.debug.push(`Dims: ${dimsString}`);
-                    
-                    // FORCE ID: Even if search fails, we return this name
+                    intel.debug.push(`Original Dims: ${dims.width}x${dims.height}`);
                     const gen = identifyGeneratorByRes(dims.width, dims.height);
                     if (gen !== "Unknown") intel.ai_generator_name = `${gen} (Resolution Match)`;
                 }
 
-                // Create the "1MB Slice" Payload
-                // If larger than 1MB, we resize or just take the buffer (Resizing is safer but slow)
-                // Here we stick to raw base64 but ensure it exists
-                if (buffer.length > 0) {
-                    base64Payload = buffer.toString('base64');
+                // 2. Fetch RESIZED (512px) for API Payload
+                // This is the "Standard Unit" for AI visual search. It's fast and readable.
+                let searchUrl = mediaUrl;
+                if (mediaUrl.includes('cloudinary')) {
+                    searchUrl = mediaUrl.replace('/upload/', '/upload/w_512,c_fit,q_auto/');
                 }
+                
+                const resizedRes = await fetch(searchUrl);
+                const resizedBuffer = Buffer.from(await resizedRes.arrayBuffer());
+                
+                base64Payload = resizedBuffer.toString('base64');
+                intel.debug.push(`Standardized Payload: ${Math.round(base64Payload.length/1024)}KB`);
+
             } catch (e) { intel.debug.push(`Prep Error: ${e.message}`); }
         }
 
-        if (apiKey && !isAudio) {
+        if (apiKey && !isAudio && base64Payload) {
             let rawMatches = [];
 
-            // --- STRATEGY A: VISUAL SEARCH (Base64) ---
-            if (base64Payload) {
-                try {
-                    const lRes = await fetch("https://google.serper.dev/lens", {
-                        method: "POST",
-                        headers: { "X-API-KEY": apiKey, "Content-Type": "application/json" },
-                        body: JSON.stringify({ image: base64Payload })
-                    });
-                    const lData = await lRes.json();
-                    
-                    if (lData.knowledgeGraph) rawMatches.push(lData.knowledgeGraph);
-                    if (lData.visualMatches) rawMatches = rawMatches.concat(lData.visualMatches);
-                    
-                    if (rawMatches.length > 0) intel.method = "Visual Fingerprint";
-                } catch (e) { intel.debug.push("Visual Search Error"); }
-            }
-
-            // --- STRATEGY B: CONTEXT SEARCH (The Safety Net) ---
-            // If Visual failed, search for the resolution + "AI" to find source discussions
-            if (rawMatches.length === 0 && dimsString) {
-                const query = `"${dimsString}" AI image`;
-                intel.debug.push(`Safety Search: ${query}`);
-                try {
-                    const sRes = await fetch("https://google.serper.dev/search", {
-                        method: "POST",
-                        headers: { "X-API-KEY": apiKey, "Content-Type": "application/json" },
-                        body: JSON.stringify({ q: query })
-                    });
-                    const sData = await sRes.json();
-                    if (sData.organic) rawMatches = rawMatches.concat(sData.organic);
-                    
-                    if (rawMatches.length > 0) intel.method = "Resolution Footprint";
-                } catch (e) {}
-            }
+            // --- STRATEGY: PURE VISUAL SEARCH ---
+            try {
+                const lRes = await fetch("https://google.serper.dev/lens", {
+                    method: "POST",
+                    headers: { "X-API-KEY": apiKey, "Content-Type": "application/json" },
+                    body: JSON.stringify({ image: base64Payload })
+                });
+                const lData = await lRes.json();
+                
+                if (lData.knowledgeGraph) rawMatches.push(lData.knowledgeGraph);
+                if (lData.visualMatches) rawMatches = rawMatches.concat(lData.visualMatches);
+                
+                if (rawMatches.length > 0) intel.method = "Visual Fingerprint";
+            } catch (e) { intel.debug.push("Visual Search Error"); }
 
             // --- PROCESSING ---
             const cleanMatches = rawMatches.filter(m => 
@@ -149,7 +130,6 @@ export default async function handler(req, res) {
                 posted_time: "Found Online"
             }));
 
-            // Context Gen ID Update (Only if Context found something better)
             if (cleanMatches.length > 0 && intel.ai_generator_name === "Unknown") {
                 const combined = cleanMatches.map(m => (m.title||"") + " " + (m.source||"")).join(" ").toLowerCase();
                 if (combined.includes("midjourney")) intel.ai_generator_name = "Midjourney (Context)";
@@ -157,18 +137,26 @@ export default async function handler(req, res) {
             }
         }
 
-        // --- FINAL FALLBACK ---
+        // --- FINAL FALLBACK (Manual Links Only - No Fake Data) ---
         if (intel.totalMatches === 0) {
             intel.matches.push({
                 source_name: "Google Lens (Manual)",
-                title: "No Public Index Found - Click to Verify",
+                title: "No Public Index - Click to Verify",
                 url: `https://lens.google.com/uploadbyurl?url=${encodeURIComponent(mediaUrl)}`,
-                posted_time: "Image is unique"
+                posted_time: "Image is likely unique or private"
+            });
+            
+            // Adding Yandex as it is often better for deep image search
+            intel.matches.push({
+                source_name: "Yandex Images",
+                title: "Deep Search (Yandex)",
+                url: `https://yandex.com/images/search?rpt=imageview&url=${encodeURIComponent(mediaUrl)}`,
+                posted_time: "Alternative Engine"
             });
         }
 
         return res.status(200).json({
-            service: "osint-final-stand-v37",
+            service: "osint-purist-v38",
             footprintAnalysis: intel,
             timelineIntel: { first_seen: "Analyzed", last_seen: "Just Now" }
         });
